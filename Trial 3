@@ -1,0 +1,763 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from scipy.interpolate import UnivariateSpline
+from scipy.spatial.distance import mahalanobis
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+HEALTHY_START = 20
+HEALTHY_END = 60
+
+DETECTION_START = 60
+
+BIN_SIZE = 2                 # lifecycle bins: 0,2,4,...100
+PERCENTILE = 95              # ESN-specific threshold
+
+PERSISTENCE_WINDOW = 5
+PERSISTENCE_REQUIRED = 3
+
+MIN_HEALTHY_POINTS = 20
+
+# Small regularization added to covariance matrices
+COV_REGULARIZATION = 1e-6
+
+
+# ============================================================
+# 1. COPY DATA
+# ============================================================
+
+df = before_replacement.copy()
+
+df = df.sort_values(
+    ['ESN', 'LIFE_PERCENT']
+).reset_index(drop=True)
+
+
+# ============================================================
+# 2. CLEAN DATA
+# ============================================================
+
+required_columns = ['ESN', 'LIFE_PERCENT'] + ema_columns
+
+missing_columns = [
+    col for col in required_columns
+    if col not in df.columns
+]
+
+if missing_columns:
+    raise ValueError(
+        f"Missing columns: {missing_columns}"
+    )
+
+df = df.dropna(
+    subset=['ESN', 'LIFE_PERCENT'] + ema_columns
+).copy()
+
+
+# ============================================================
+# 3. LIMIT LIFE PERCENT TO 0-100
+# ============================================================
+
+df = df[
+    (df['LIFE_PERCENT'] >= 0) &
+    (df['LIFE_PERCENT'] <= 100)
+].copy()
+
+
+# ============================================================
+# 4. CREATE LIFECYCLE BINS
+# ============================================================
+
+bins = np.arange(
+    0,
+    100 + BIN_SIZE,
+    BIN_SIZE
+)
+
+labels = np.arange(
+    0,
+    100,
+    BIN_SIZE
+)
+
+df['LIFE_BIN'] = pd.cut(
+    df['LIFE_PERCENT'],
+    bins=bins,
+    labels=labels,
+    include_lowest=True,
+    right=False
+)
+
+df['LIFE_BIN'] = df['LIFE_BIN'].astype(float)
+
+
+# ============================================================
+# 5. BUILD FLEET LIFECYCLE TRAJECTORY
+# ============================================================
+#
+# For every lifecycle point, calculate the median behaviour
+# across ALL ESNs.
+#
+# Example:
+#
+# 20% -> normal fleet feature value
+# 22% -> normal fleet feature value
+# ...
+# 100% -> normal fleet feature value
+#
+# This captures common lifecycle behaviour.
+#
+# Therefore, if EVERY ESN changes around 65-70%, that common
+# change becomes part of the expected trajectory instead of
+# automatically becoming an anomaly.
+# ============================================================
+
+fleet_trajectory = (
+    df.groupby('LIFE_BIN', observed=True)[ema_columns]
+      .median()
+      .reset_index()
+)
+
+
+# ============================================================
+# 6. INTERPOLATE FLEET TRAJECTORY
+# ============================================================
+#
+# We need an expected value for every individual row.
+#
+# We therefore interpolate the fleet median trajectory.
+#
+# PCHIP is safer than an aggressive spline because it does not
+# create excessive oscillations between points.
+# ============================================================
+
+from scipy.interpolate import PchipInterpolator
+
+
+fleet_models = {}
+
+for col in ema_columns:
+
+    temp = fleet_trajectory[
+        ['LIFE_BIN', col]
+    ].dropna()
+
+    if len(temp) < 3:
+        print(
+            f"WARNING: Not enough fleet data for {col}"
+        )
+        continue
+
+    x = temp['LIFE_BIN'].values
+    y = temp[col].values
+
+    fleet_models[col] = PchipInterpolator(
+        x,
+        y,
+        extrapolate=True
+    )
+
+
+# ============================================================
+# 7. CALCULATE EXPECTED FLEET VALUE
+# ============================================================
+
+for col in ema_columns:
+
+    if col not in fleet_models:
+        continue
+
+    df[f'{col}_EXPECTED'] = fleet_models[col](
+        df['LIFE_PERCENT'].values
+    )
+
+
+# ============================================================
+# 8. CALCULATE LIFECYCLE-ADJUSTED RESIDUALS
+# ============================================================
+#
+# Residual =
+#
+#       ACTUAL ESN VALUE
+#       -
+#       EXPECTED FLEET VALUE
+#
+# This removes the common lifecycle trajectory.
+#
+# Example:
+#
+# Fleet expected at 70% = 5.0
+# ESN actual at 70%     = 5.2
+#
+# residual = +0.2
+#
+# Another ESN:
+#
+# Fleet expected at 70% = 5.0
+# ESN actual             = 8.0
+#
+# residual = +3.0
+#
+# The second ESN is behaving very differently from the fleet.
+# ============================================================
+
+residual_columns = []
+
+for col in ema_columns:
+
+    expected_col = f'{col}_EXPECTED'
+    residual_col = f'{col}_RESIDUAL'
+
+    df[residual_col] = (
+        df[col] -
+        df[expected_col]
+    )
+
+    residual_columns.append(residual_col)
+
+
+# ============================================================
+# 9. CALCULATE ESN-SPECIFIC HEALTHY RESIDUAL STATISTICS
+# ============================================================
+#
+# IMPORTANT:
+#
+# Every ESN gets its OWN healthy baseline.
+#
+# Healthy region:
+#
+#       20% <= LIFE_PERCENT <= 60%
+#
+# We calculate:
+#
+# mean residual vector
+# covariance matrix
+#
+# separately for every ESN.
+# ============================================================
+
+results = []
+
+esns = df['ESN'].unique()
+
+print("=" * 70)
+print("ESN-SPECIFIC LIFECYCLE-ADJUSTED MAHALANOBIS")
+print("=" * 70)
+
+print(f"Total ESNs: {len(esns)}")
+
+
+# ============================================================
+# 10. PROCESS EACH ESN
+# ============================================================
+
+for esn in esns:
+
+    esn_df = df[
+        df['ESN'] == esn
+    ].copy()
+
+    esn_df = esn_df.sort_values(
+        'LIFE_PERCENT'
+    ).reset_index(drop=True)
+
+
+    # --------------------------------------------------------
+    # HEALTHY DATA FOR THIS ESN
+    # --------------------------------------------------------
+
+    healthy_mask = (
+        (esn_df['LIFE_PERCENT'] >= HEALTHY_START) &
+        (esn_df['LIFE_PERCENT'] <= HEALTHY_END)
+    )
+
+    healthy_data = esn_df[
+        healthy_mask
+    ].copy()
+
+
+    # Remove rows with missing residuals
+
+    healthy_data = healthy_data.dropna(
+        subset=residual_columns
+    )
+
+
+    if len(healthy_data) < MIN_HEALTHY_POINTS:
+
+        print(
+            f"ESN {esn}: "
+            f"insufficient healthy observations "
+            f"({len(healthy_data)})"
+        )
+
+        continue
+
+
+    # --------------------------------------------------------
+    # ESN-SPECIFIC HEALTHY MEAN
+    # --------------------------------------------------------
+
+    healthy_mean = (
+        healthy_data[residual_columns]
+        .mean()
+        .values
+    )
+
+
+    # --------------------------------------------------------
+    # ESN-SPECIFIC HEALTHY COVARIANCE
+    # --------------------------------------------------------
+
+    healthy_cov = (
+        healthy_data[residual_columns]
+        .cov()
+        .values
+    )
+
+
+    # --------------------------------------------------------
+    # REGULARIZE COVARIANCE
+    # --------------------------------------------------------
+    #
+    # Covariance matrices can sometimes be singular because
+    # features are strongly correlated.
+    #
+    # Add a tiny value to diagonal.
+    # --------------------------------------------------------
+
+    healthy_cov = (
+        healthy_cov +
+        np.eye(len(residual_columns))
+        * COV_REGULARIZATION
+    )
+
+
+    # --------------------------------------------------------
+    # INVERSE COVARIANCE
+    # --------------------------------------------------------
+
+    try:
+
+        cov_inv = np.linalg.pinv(
+            healthy_cov
+        )
+
+    except Exception as e:
+
+        print(
+            f"ESN {esn}: covariance inversion failed"
+        )
+
+        continue
+
+
+    # ========================================================
+    # 11. MAHALANOBIS FOR HEALTHY DATA
+    # ========================================================
+
+    healthy_md = []
+
+    for _, row in healthy_data.iterrows():
+
+        x = row[
+            residual_columns
+        ].values.astype(float)
+
+        diff = x - healthy_mean
+
+        md_squared = (
+            diff.T @ cov_inv @ diff
+        )
+
+        md = np.sqrt(
+            max(md_squared, 0)
+        )
+
+        healthy_md.append(md)
+
+
+    healthy_md = np.array(
+        healthy_md
+    )
+
+
+    # ========================================================
+    # 12. ESN-SPECIFIC THRESHOLD
+    # ========================================================
+    #
+    # NOT fleet-wide.
+    #
+    # Every ESN gets its own threshold.
+    # ========================================================
+
+    threshold = np.percentile(
+        healthy_md,
+        PERCENTILE
+    )
+
+
+    # ========================================================
+    # 13. CALCULATE MAHALANOBIS FOR ALL OBSERVATIONS
+    # ========================================================
+
+    md_values = []
+
+    for _, row in esn_df.iterrows():
+
+        x = row[
+            residual_columns
+        ].values.astype(float)
+
+        diff = x - healthy_mean
+
+        md_squared = (
+            diff.T @ cov_inv @ diff
+        )
+
+        md = np.sqrt(
+            max(md_squared, 0)
+        )
+
+        md_values.append(md)
+
+
+    esn_df['RESIDUAL_MAHALANOBIS'] = md_values
+
+
+    # ========================================================
+    # 14. RAW ANOMALY FLAG
+    # ========================================================
+
+    esn_df['RAW_ANOMALY'] = (
+        (esn_df['LIFE_PERCENT'] >= DETECTION_START) &
+        (esn_df['RESIDUAL_MAHALANOBIS'] > threshold)
+    )
+
+
+    # ========================================================
+    # 15. PERSISTENCE
+    # ========================================================
+    #
+    # We don't want ONE abnormal flight to trigger detection.
+    #
+    # Requirement:
+    #
+    # 3 out of the previous 5 observations
+    #
+    # must be anomalous.
+    # ========================================================
+
+    rolling_count = (
+        esn_df['RAW_ANOMALY']
+        .astype(int)
+        .rolling(
+            window=PERSISTENCE_WINDOW,
+            min_periods=PERSISTENCE_WINDOW
+        )
+        .sum()
+    )
+
+    esn_df['PERSISTENT_ANOMALY'] = (
+        rolling_count >= PERSISTENCE_REQUIRED
+    )
+
+
+    # ========================================================
+    # 16. FIND FIRST PERSISTENT DETECTION
+    # ========================================================
+
+    detections = esn_df[
+        esn_df['PERSISTENT_ANOMALY']
+    ]
+
+    if len(detections) > 0:
+
+        first_detection = detections.iloc[0]
+
+        detection_life = (
+            first_detection['LIFE_PERCENT']
+        )
+
+    else:
+
+        detection_life = np.nan
+
+
+    # ========================================================
+    # 17. STORE RESULTS
+    # ========================================================
+
+    esn_df['ESN_THRESHOLD'] = threshold
+    esn_df['HEALTHY_MD_MEAN'] = healthy_md.mean()
+    esn_df['HEALTHY_MD_MEDIAN'] = np.median(
+        healthy_md
+    )
+    esn_df['DETECTION_LIFE'] = detection_life
+
+
+    results.append(esn_df)
+
+
+# ============================================================
+# 18. COMBINE ALL ESNs
+# ============================================================
+
+if len(results) == 0:
+
+    raise ValueError(
+        "No ESNs could be processed."
+    )
+
+
+final_results = pd.concat(
+    results,
+    ignore_index=True
+)
+
+
+# ============================================================
+# 19. DETECTION SUMMARY
+# ============================================================
+
+detection_summary = (
+    final_results
+    .groupby('ESN')
+    .agg(
+        ESN_THRESHOLD=(
+            'ESN_THRESHOLD',
+            'first'
+        ),
+
+        HEALTHY_MD_MEAN=(
+            'HEALTHY_MD_MEAN',
+            'first'
+        ),
+
+        HEALTHY_MD_MEDIAN=(
+            'HEALTHY_MD_MEDIAN',
+            'first'
+        ),
+
+        DETECTION_LIFE=(
+            'DETECTION_LIFE',
+            'first'
+        )
+    )
+    .reset_index()
+)
+
+
+# ============================================================
+# 20. SUMMARY STATISTICS
+# ============================================================
+
+detected = detection_summary[
+    detection_summary['DETECTION_LIFE'].notna()
+]
+
+not_detected = detection_summary[
+    detection_summary['DETECTION_LIFE'].isna()
+]
+
+
+print("\n")
+print("=" * 70)
+print("FINAL SUMMARY")
+print("=" * 70)
+
+print(
+    f"Total ESNs processed: "
+    f"{len(detection_summary)}"
+)
+
+print(
+    f"ESNs with detection: "
+    f"{len(detected)}"
+)
+
+print(
+    f"ESNs without detection: "
+    f"{len(not_detected)}"
+)
+
+
+if len(detected) > 0:
+
+    print("\nDetection statistics:")
+
+    print(
+        f"Median detection: "
+        f"{detected['DETECTION_LIFE'].median():.2f}%"
+    )
+
+    print(
+        f"Mean detection: "
+        f"{detected['DETECTION_LIFE'].mean():.2f}%"
+    )
+
+    print(
+        f"Minimum detection: "
+        f"{detected['DETECTION_LIFE'].min():.2f}%"
+    )
+
+    print(
+        f"Maximum detection: "
+        f"{detected['DETECTION_LIFE'].max():.2f}%"
+    )
+
+
+# ============================================================
+# 21. SHOW ESN SUMMARY TABLE
+# ============================================================
+
+print("\n")
+print("=" * 70)
+print("ESN SUMMARY")
+print("=" * 70)
+
+print(
+    detection_summary.to_string(
+        index=False
+    )
+)
+
+
+# ============================================================
+# 22. PLOT INDIVIDUAL ESNs
+# ============================================================
+#
+# This is the most important visualisation.
+#
+# Blue  = lifecycle-adjusted Mahalanobis
+# Red   = ESN-specific threshold
+# Dots  = persistent anomalies
+#
+# IMPORTANT:
+#
+# The threshold is different for every ESN.
+# ============================================================
+
+for esn in detection_summary['ESN']:
+
+    plot_data = final_results[
+        final_results['ESN'] == esn
+    ].copy()
+
+    if plot_data.empty:
+        continue
+
+
+    threshold = (
+        plot_data['ESN_THRESHOLD']
+        .iloc[0]
+    )
+
+
+    plt.figure(
+        figsize=(12, 5)
+    )
+
+
+    # Mahalanobis
+
+    plt.plot(
+        plot_data['LIFE_PERCENT'],
+        plot_data[
+            'RESIDUAL_MAHALANOBIS'
+        ],
+        label='Lifecycle-adjusted Mahalanobis'
+    )
+
+
+    # Threshold
+
+    plt.axhline(
+        threshold,
+        linestyle='--',
+        label=f'ESN 95% threshold ({threshold:.2f})'
+    )
+
+
+    # Persistent anomalies
+
+    persistent = plot_data[
+        plot_data['PERSISTENT_ANOMALY']
+    ]
+
+    if not persistent.empty:
+
+        plt.scatter(
+            persistent['LIFE_PERCENT'],
+            persistent[
+                'RESIDUAL_MAHALANOBIS'
+            ],
+            label='Persistent anomaly',
+            zorder=5
+        )
+
+
+    # Detection start
+
+    plt.axvline(
+        DETECTION_START,
+        linestyle=':',
+        label=f'Detection starts ({DETECTION_START}%)'
+    )
+
+
+    plt.title(
+        f'Lifecycle-Adjusted Residual Mahalanobis - ESN {esn}'
+    )
+
+    plt.xlabel(
+        'Life Percent (%)'
+    )
+
+    plt.ylabel(
+        'Residual Mahalanobis Distance'
+    )
+
+    plt.legend()
+
+    plt.grid(
+        alpha=0.3
+    )
+
+    plt.tight_layout()
+
+    plt.show()
+
+
+# ============================================================
+# 23. SAVE RESULTS
+# ============================================================
+
+final_results.to_csv(
+    'lifecycle_adjusted_mahalanobis_results.csv',
+    index=False
+)
+
+detection_summary.to_csv(
+    'lifecycle_adjusted_mahalanobis_summary.csv',
+    index=False
+)
+
+
+print("\n")
+print(
+    "Results saved:"
+)
+
+print(
+    "lifecycle_adjusted_mahalanobis_results.csv"
+)
+
+print(
+    "lifecycle_adjusted_mahalanobis_summary.csv"
+)
