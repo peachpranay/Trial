@@ -1,0 +1,1125 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from scipy.interpolate import PchipInterpolator
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+HEALTHY_START = 20
+HEALTHY_END = 60
+
+# Don't make a decision before this point
+DETECTION_START = 60
+
+# Number of observations used for rolling MD
+ROLLING_WINDOW = 10
+
+# Number of observations used to calculate slope
+SLOPE_WINDOW = 10
+
+# Persistence:
+# condition must be true for this many consecutive observations
+PERSISTENCE = 5
+
+# Healthy slope percentile
+SLOPE_PERCENTILE = 95
+
+# Healthy rolling-MD percentile
+MD_PERCENTILE = 95
+
+# Minimum number of healthy observations
+MIN_HEALTHY_POINTS = 20
+
+# Small regularisation for covariance matrix
+COV_REGULARIZATION = 1e-6
+
+
+# ============================================================
+# 1. COPY DATA
+# ============================================================
+
+df = before_replacement.copy()
+
+df = df.sort_values(
+    ['ESN', 'LIFE_PERCENT']
+).reset_index(drop=True)
+
+
+# ============================================================
+# 2. CHECK REQUIRED COLUMNS
+# ============================================================
+
+required_columns = [
+    'ESN',
+    'LIFE_PERCENT'
+] + ema_columns
+
+missing_columns = [
+    c for c in required_columns
+    if c not in df.columns
+]
+
+if missing_columns:
+
+    raise ValueError(
+        f"Missing columns: {missing_columns}"
+    )
+
+
+# ============================================================
+# 3. CLEAN DATA
+# ============================================================
+
+df = df.dropna(
+    subset=['ESN', 'LIFE_PERCENT'] + ema_columns
+).copy()
+
+df = df[
+    (df['LIFE_PERCENT'] >= 0) &
+    (df['LIFE_PERCENT'] <= 100)
+].copy()
+
+
+# ============================================================
+# 4. CREATE LIFE BINS
+# ============================================================
+
+BIN_SIZE = 2
+
+bins = np.arange(
+    0,
+    102,
+    BIN_SIZE
+)
+
+labels = np.arange(
+    0,
+    100,
+    BIN_SIZE
+)
+
+df['LIFE_BIN'] = pd.cut(
+    df['LIFE_PERCENT'],
+    bins=bins,
+    labels=labels,
+    include_lowest=True,
+    right=False
+)
+
+df['LIFE_BIN'] = df['LIFE_BIN'].astype(float)
+
+
+# ============================================================
+# 5. BUILD NORMAL FLEET LIFECYCLE TRAJECTORY
+# ============================================================
+#
+# For every lifecycle point we calculate the median behaviour
+# across ALL ESNs.
+#
+# This represents what normally happens as the breather ages.
+# ============================================================
+
+fleet_trajectory = (
+    df.groupby(
+        'LIFE_BIN',
+        observed=True
+    )[ema_columns]
+    .median()
+    .reset_index()
+)
+
+
+# ============================================================
+# 6. FIT FLEET TRAJECTORY
+# ============================================================
+
+fleet_models = {}
+
+for col in ema_columns:
+
+    temp = fleet_trajectory[
+        ['LIFE_BIN', col]
+    ].dropna()
+
+    if len(temp) < 3:
+        print(
+            f"Skipping fleet model for {col}"
+        )
+        continue
+
+    x = temp['LIFE_BIN'].values
+    y = temp[col].values
+
+    fleet_models[col] = PchipInterpolator(
+        x,
+        y,
+        extrapolate=True
+    )
+
+
+# ============================================================
+# 7. CALCULATE EXPECTED FLEET VALUE
+# ============================================================
+
+for col in ema_columns:
+
+    if col not in fleet_models:
+        continue
+
+    expected_col = f'{col}_EXPECTED'
+
+    df[expected_col] = fleet_models[col](
+        df['LIFE_PERCENT'].values
+    )
+
+
+# ============================================================
+# 8. CALCULATE LIFECYCLE-ADJUSTED RESIDUALS
+# ============================================================
+#
+# Actual - expected fleet behaviour
+#
+# This removes the common lifecycle trajectory.
+# ============================================================
+
+residual_columns = []
+
+for col in ema_columns:
+
+    expected_col = f'{col}_EXPECTED'
+    residual_col = f'{col}_RESIDUAL'
+
+    df[residual_col] = (
+        df[col] -
+        df[expected_col]
+    )
+
+    residual_columns.append(
+        residual_col
+    )
+
+
+# ============================================================
+# 9. FUNCTION TO CALCULATE MAHALANOBIS
+# ============================================================
+
+def calculate_md(
+    x,
+    mean_vector,
+    covariance_inverse
+):
+
+    x = np.asarray(
+        x,
+        dtype=float
+    )
+
+    diff = (
+        x -
+        mean_vector
+    )
+
+    md_squared = (
+        diff.T
+        @ covariance_inverse
+        @ diff
+    )
+
+    return np.sqrt(
+        max(md_squared, 0)
+    )
+
+
+# ============================================================
+# 10. FUNCTION TO CALCULATE ROLLING SLOPE
+# ============================================================
+#
+# We fit:
+#
+# MD = slope * life + intercept
+#
+# A positive slope means MD is increasing.
+# ============================================================
+
+def calculate_slope(
+    life_values,
+    md_values
+):
+
+    if len(life_values) < 3:
+
+        return np.nan
+
+    x = np.asarray(
+        life_values,
+        dtype=float
+    )
+
+    y = np.asarray(
+        md_values,
+        dtype=float
+    )
+
+    if (
+        np.any(~np.isfinite(x)) or
+        np.any(~np.isfinite(y))
+    ):
+        return np.nan
+
+    try:
+
+        slope = np.polyfit(
+            x,
+            y,
+            1
+        )[0]
+
+        return slope
+
+    except:
+
+        return np.nan
+
+
+# ============================================================
+# 11. PROCESS EVERY ESN
+# ============================================================
+
+all_results = []
+
+summary_results = []
+
+
+esns = df['ESN'].unique()
+
+print("=" * 80)
+print("MAHALANOBIS TRAJECTORY + SLOPE + PERSISTENCE")
+print("=" * 80)
+
+print(
+    f"Total ESNs: {len(esns)}"
+)
+
+
+for esn in esns:
+
+    print(
+        f"\nProcessing ESN: {esn}"
+    )
+
+
+    # ========================================================
+    # GET ESN DATA
+    # ========================================================
+
+    esn_df = df[
+        df['ESN'] == esn
+    ].copy()
+
+    esn_df = esn_df.sort_values(
+        'LIFE_PERCENT'
+    ).reset_index(drop=True)
+
+
+    # ========================================================
+    # HEALTHY DATA
+    # ========================================================
+
+    healthy_mask = (
+        (esn_df['LIFE_PERCENT'] >= HEALTHY_START) &
+        (esn_df['LIFE_PERCENT'] <= HEALTHY_END)
+    )
+
+    healthy_df = esn_df[
+        healthy_mask
+    ].copy()
+
+
+    healthy_df = healthy_df.dropna(
+        subset=residual_columns
+    )
+
+
+    if len(healthy_df) < MIN_HEALTHY_POINTS:
+
+        print(
+            f"  Not enough healthy observations: "
+            f"{len(healthy_df)}"
+        )
+
+        continue
+
+
+    # ========================================================
+    # ESN-SPECIFIC HEALTHY MEAN
+    # ========================================================
+
+    healthy_mean = (
+        healthy_df[
+            residual_columns
+        ]
+        .mean()
+        .values
+    )
+
+
+    # ========================================================
+    # ESN-SPECIFIC HEALTHY COVARIANCE
+    # ========================================================
+
+    healthy_cov = (
+        healthy_df[
+            residual_columns
+        ]
+        .cov()
+        .values
+    )
+
+
+    # ========================================================
+    # REGULARISE COVARIANCE
+    # ========================================================
+
+    healthy_cov = (
+        healthy_cov
+        +
+        np.eye(
+            len(residual_columns)
+        )
+        * COV_REGULARIZATION
+    )
+
+
+    # ========================================================
+    # INVERSE COVARIANCE
+    # ========================================================
+
+    covariance_inverse = np.linalg.pinv(
+        healthy_cov
+    )
+
+
+    # ========================================================
+    # 12. CALCULATE MAHALANOBIS FOR EVERY OBSERVATION
+    # ========================================================
+
+    md_values = []
+
+    for _, row in esn_df.iterrows():
+
+        x = row[
+            residual_columns
+        ].values
+
+        md = calculate_md(
+            x,
+            healthy_mean,
+            covariance_inverse
+        )
+
+        md_values.append(md)
+
+
+    esn_df[
+        'RESIDUAL_MAHALANOBIS'
+    ] = md_values
+
+
+    # ========================================================
+    # 13. ROLLING MAHALANOBIS
+    # ========================================================
+    #
+    # Removes individual-flight noise.
+    # ========================================================
+
+    esn_df[
+        'ROLLING_MD'
+    ] = (
+        esn_df[
+            'RESIDUAL_MAHALANOBIS'
+        ]
+        .rolling(
+            window=ROLLING_WINDOW,
+            min_periods=ROLLING_WINDOW
+        )
+        .mean()
+    )
+
+
+    # ========================================================
+    # 14. CALCULATE ROLLING SLOPE
+    # ========================================================
+    #
+    # For each point:
+    #
+    # Take previous N MD values
+    #
+    # Fit:
+    #
+    # MD = slope * life + intercept
+    #
+    # Positive slope = increasing abnormality.
+    # ========================================================
+
+    slopes = []
+
+    for i in range(
+        len(esn_df)
+    ):
+
+        if i < SLOPE_WINDOW - 1:
+
+            slopes.append(
+                np.nan
+            )
+
+            continue
+
+
+        window_df = esn_df.iloc[
+            i - SLOPE_WINDOW + 1 :
+            i + 1
+        ]
+
+
+        slope = calculate_slope(
+            window_df[
+                'LIFE_PERCENT'
+            ].values,
+
+            window_df[
+                'ROLLING_MD'
+            ].values
+        )
+
+
+        slopes.append(
+            slope
+        )
+
+
+    esn_df[
+        'MD_SLOPE'
+    ] = slopes
+
+
+    # ========================================================
+    # 15. CALCULATE SLOPE ACCELERATION
+    # ========================================================
+    #
+    # Change in slope.
+    #
+    # Positive acceleration means the MD is not just increasing,
+    # but increasing faster.
+    # ========================================================
+
+    esn_df[
+        'SLOPE_ACCELERATION'
+    ] = (
+        esn_df[
+            'MD_SLOPE'
+        ]
+        .diff()
+    )
+
+
+    # ========================================================
+    # 16. HEALTHY MD THRESHOLD
+    # ========================================================
+
+    healthy_md_values = (
+        esn_df.loc[
+            healthy_mask,
+            'ROLLING_MD'
+        ]
+        .dropna()
+        .values
+    )
+
+
+    if len(healthy_md_values) > 5:
+
+        healthy_md_threshold = (
+            np.percentile(
+                healthy_md_values,
+                MD_PERCENTILE
+            )
+        )
+
+    else:
+
+        healthy_md_threshold = np.nan
+
+
+    # ========================================================
+    # 17. HEALTHY SLOPE THRESHOLD
+    # ========================================================
+
+    healthy_slope_values = (
+        esn_df.loc[
+            healthy_mask,
+            'MD_SLOPE'
+        ]
+        .dropna()
+        .values
+    )
+
+
+    if len(healthy_slope_values) > 5:
+
+        healthy_slope_threshold = (
+            np.percentile(
+                healthy_slope_values,
+                SLOPE_PERCENTILE
+            )
+        )
+
+    else:
+
+        healthy_slope_threshold = np.nan
+
+
+    # ========================================================
+    # 18. MAKE SURE SLOPE THRESHOLD IS POSITIVE
+    # ========================================================
+    #
+    # We don't want a slightly positive noise slope to trigger.
+    # ========================================================
+
+    if np.isfinite(
+        healthy_slope_threshold
+    ):
+
+        slope_threshold = max(
+            healthy_slope_threshold,
+            0
+        )
+
+    else:
+
+        slope_threshold = np.nan
+
+
+    # ========================================================
+    # 19. DETECTION CONDITIONS
+    # ========================================================
+    #
+    # CONDITION 1:
+    #
+    # We are past detection start.
+    #
+    # CONDITION 2:
+    #
+    # Rolling MD is above healthy behaviour.
+    #
+    # CONDITION 3:
+    #
+    # MD is increasing faster than healthy behaviour.
+    #
+    # CONDITION 4:
+    #
+    # Slope acceleration is positive.
+    #
+    # The acceleration condition is deliberately NOT required
+    # at every point because real degradation may be gradual.
+    # ========================================================
+
+    esn_df[
+        'MD_ABOVE_HEALTHY'
+    ] = (
+        esn_df[
+            'ROLLING_MD'
+        ]
+        >
+        healthy_md_threshold
+    )
+
+
+    esn_df[
+        'SLOPE_ABOVE_HEALTHY'
+    ] = (
+        esn_df[
+            'MD_SLOPE'
+        ]
+        >
+        slope_threshold
+    )
+
+
+    esn_df[
+        'POSITIVE_ACCELERATION'
+    ] = (
+        esn_df[
+            'SLOPE_ACCELERATION'
+        ]
+        > 0
+    )
+
+
+    # ========================================================
+    # 20. COMBINED DEGRADATION SIGNAL
+    # ========================================================
+
+    esn_df[
+        'DEGRADATION_SIGNAL'
+    ] = (
+
+        (esn_df['LIFE_PERCENT'] >= DETECTION_START)
+
+        &
+
+        esn_df[
+            'MD_ABOVE_HEALTHY'
+        ]
+
+        &
+
+        esn_df[
+            'SLOPE_ABOVE_HEALTHY'
+        ]
+    )
+
+
+    # ========================================================
+    # 21. PERSISTENCE
+    # ========================================================
+    #
+    # Instead of:
+    #
+    # ONE point > threshold
+    #
+    # we require:
+    #
+    # PERSISTENCE consecutive observations.
+    # ========================================================
+
+    consecutive_count = (
+        esn_df[
+            'DEGRADATION_SIGNAL'
+        ]
+        .astype(int)
+        .groupby(
+            (
+                esn_df[
+                    'DEGRADATION_SIGNAL'
+                ]
+                .astype(int)
+                .diff()
+                .ne(0)
+                .cumsum()
+            )
+        )
+        .cumsum()
+    )
+
+
+    esn_df[
+        'PERSISTENCE_COUNT'
+    ] = consecutive_count
+
+
+    esn_df[
+        'PERSISTENT_DEGRADATION'
+    ] = (
+        esn_df[
+            'PERSISTENCE_COUNT'
+        ]
+        >= PERSISTENCE
+    )
+
+
+    # ========================================================
+    # 22. FIRST DETECTION
+    # ========================================================
+
+    detected_rows = esn_df[
+        esn_df[
+            'PERSISTENT_DEGRADATION'
+        ]
+    ]
+
+
+    if not detected_rows.empty:
+
+        first_detection = (
+            detected_rows.iloc[0]
+        )
+
+        detection_life = (
+            first_detection[
+                'LIFE_PERCENT'
+            ]
+        )
+
+    else:
+
+        detection_life = np.nan
+
+
+    # ========================================================
+    # 23. STORE ESN THRESHOLDS
+    # ========================================================
+
+    esn_df[
+        'HEALTHY_MD_THRESHOLD'
+    ] = healthy_md_threshold
+
+    esn_df[
+        'HEALTHY_SLOPE_THRESHOLD'
+    ] = slope_threshold
+
+    esn_df[
+        'DETECTION_LIFE'
+    ] = detection_life
+
+
+    # ========================================================
+    # 24. STORE RESULTS
+    # ========================================================
+
+    all_results.append(
+        esn_df
+    )
+
+
+    summary_results.append({
+
+        'ESN': esn,
+
+        'HEALTHY_OBSERVATIONS':
+            len(healthy_df),
+
+        'HEALTHY_MD_THRESHOLD':
+            healthy_md_threshold,
+
+        'HEALTHY_SLOPE_THRESHOLD':
+            slope_threshold,
+
+        'DETECTION_LIFE':
+            detection_life
+    })
+
+
+# ============================================================
+# 25. COMBINE RESULTS
+# ============================================================
+
+if not all_results:
+
+    raise ValueError(
+        "No ESNs were successfully processed."
+    )
+
+
+final_results = pd.concat(
+    all_results,
+    ignore_index=True
+)
+
+
+detection_summary = pd.DataFrame(
+    summary_results
+)
+
+
+# ============================================================
+# 26. DETECTION SUMMARY
+# ============================================================
+
+detected = detection_summary[
+    detection_summary[
+        'DETECTION_LIFE'
+    ].notna()
+]
+
+not_detected = detection_summary[
+    detection_summary[
+        'DETECTION_LIFE'
+    ].isna()
+]
+
+
+print("\n")
+print("=" * 80)
+print("FINAL SUMMARY")
+print("=" * 80)
+
+print(
+    f"Total ESNs processed: "
+    f"{len(detection_summary)}"
+)
+
+print(
+    f"ESNs with detection: "
+    f"{len(detected)}"
+)
+
+print(
+    f"ESNs without detection: "
+    f"{len(not_detected)}"
+)
+
+
+if len(detected) > 0:
+
+    print("\nDetection statistics:")
+
+    print(
+        f"Median detection: "
+        f"{detected['DETECTION_LIFE'].median():.2f}%"
+    )
+
+    print(
+        f"Mean detection: "
+        f"{detected['DETECTION_LIFE'].mean():.2f}%"
+    )
+
+    print(
+        f"Minimum detection: "
+        f"{detected['DETECTION_LIFE'].min():.2f}%"
+    )
+
+    print(
+        f"Maximum detection: "
+        f"{detected['DETECTION_LIFE'].max():.2f}%"
+    )
+
+
+# ============================================================
+# 27. PRINT ESN SUMMARY
+# ============================================================
+
+print("\n")
+print("=" * 80)
+print("ESN SUMMARY")
+print("=" * 80)
+
+print(
+    detection_summary.to_string(
+        index=False
+    )
+)
+
+
+# ============================================================
+# 28. PLOT EACH ESN
+# ============================================================
+#
+# Plot:
+#
+# BLUE   = raw lifecycle-adjusted Mahalanobis
+# BLACK  = rolling MD
+# RED    = healthy MD threshold
+# GREEN  = detection points
+# ============================================================
+
+for esn in detection_summary['ESN']:
+
+    plot_data = final_results[
+        final_results['ESN'] == esn
+    ].copy()
+
+    if plot_data.empty:
+        continue
+
+
+    md_threshold = (
+        plot_data[
+            'HEALTHY_MD_THRESHOLD'
+        ].iloc[0]
+    )
+
+
+    detection_life = (
+        plot_data[
+            'DETECTION_LIFE'
+        ].iloc[0]
+    )
+
+
+    plt.figure(
+        figsize=(12, 6)
+    )
+
+
+    # --------------------------------------------------------
+    # RAW MAHALANOBIS
+    # --------------------------------------------------------
+
+    plt.plot(
+        plot_data[
+            'LIFE_PERCENT'
+        ],
+
+        plot_data[
+            'RESIDUAL_MAHALANOBIS'
+        ],
+
+        alpha=0.35,
+
+        label='Residual Mahalanobis'
+    )
+
+
+    # --------------------------------------------------------
+    # ROLLING MAHALANOBIS
+    # --------------------------------------------------------
+
+    plt.plot(
+        plot_data[
+            'LIFE_PERCENT'
+        ],
+
+        plot_data[
+            'ROLLING_MD'
+        ],
+
+        linewidth=2,
+
+        label='Rolling Mahalanobis'
+    )
+
+
+    # --------------------------------------------------------
+    # HEALTHY MD THRESHOLD
+    # --------------------------------------------------------
+
+    plt.axhline(
+        md_threshold,
+
+        linestyle='--',
+
+        label=(
+            f'Healthy MD threshold '
+            f'({md_threshold:.2f})'
+        )
+    )
+
+
+    # --------------------------------------------------------
+    # DETECTION START
+    # --------------------------------------------------------
+
+    plt.axvline(
+        DETECTION_START,
+
+        linestyle=':',
+
+        label=(
+            f'Detection region starts '
+            f'({DETECTION_START}%)'
+        )
+    )
+
+
+    # --------------------------------------------------------
+    # PERSISTENT DETECTION
+    # --------------------------------------------------------
+
+    persistent = plot_data[
+        plot_data[
+            'PERSISTENT_DEGRADATION'
+        ]
+    ]
+
+
+    if not persistent.empty:
+
+        plt.scatter(
+
+            persistent[
+                'LIFE_PERCENT'
+            ],
+
+            persistent[
+                'ROLLING_MD'
+            ],
+
+            s=30,
+
+            label='Persistent degradation',
+
+            zorder=5
+        )
+
+
+    # --------------------------------------------------------
+    # FIRST DETECTION
+    # --------------------------------------------------------
+
+    if pd.notna(
+        detection_life
+    ):
+
+        plt.axvline(
+
+            detection_life,
+
+            linestyle='-.',
+
+            label=(
+                f'First detection '
+                f'({detection_life:.1f}%)'
+            )
+        )
+
+
+    # --------------------------------------------------------
+    # FORMATTING
+    # --------------------------------------------------------
+
+    plt.title(
+        f'Mahalanobis Degradation Trajectory - ESN {esn}'
+    )
+
+    plt.xlabel(
+        'Breather Life (%)'
+    )
+
+    plt.ylabel(
+        'Mahalanobis Distance'
+    )
+
+    plt.grid(
+        alpha=0.3
+    )
+
+    plt.legend()
+
+    plt.tight_layout()
+
+    plt.show()
+
+
+# ============================================================
+# 29. SAVE RESULTS
+# ============================================================
+
+final_results.to_csv(
+    'mahalanobis_trajectory_results.csv',
+    index=False
+)
+
+
+detection_summary.to_csv(
+    'mahalanobis_trajectory_summary.csv',
+    index=False
+)
+
+
+print("\n")
+print("=" * 80)
+print("FILES SAVED")
+print("=" * 80)
+
+print(
+    "mahalanobis_trajectory_results.csv"
+)
+
+print(
+    "mahalanobis_trajectory_summary.csv"
+)
