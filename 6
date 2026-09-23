@@ -1,0 +1,445 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+
+# ============================================================
+# SETTINGS
+# ============================================================
+
+DETECTION_COL = 'DETECTION_LIFE'
+
+ESN_COL = 'ESN'
+DATETIME_COL = 'DATETIME'
+REPLACEMENT_DATE_COL = 'Confirmed Replacement Date'
+LIFE_COL = 'LIFE_PERCENT'
+ROW_COL = 'ROW_NUM'
+
+
+# ============================================================
+# 1. COPY DATA
+# ============================================================
+
+df = final_results.copy()
+
+df[DATETIME_COL] = pd.to_datetime(
+    df[DATETIME_COL],
+    errors='coerce'
+)
+
+df[REPLACEMENT_DATE_COL] = pd.to_datetime(
+    df[REPLACEMENT_DATE_COL],
+    errors='coerce'
+)
+
+
+# ============================================================
+# 2. MAKE SURE DETECTION LIFE IS NUMERIC
+# ============================================================
+
+df[DETECTION_COL] = pd.to_numeric(
+    df[DETECTION_COL],
+    errors='coerce'
+)
+
+
+# ============================================================
+# 3. GET ONE DETECTION VALUE PER ESN
+# ============================================================
+
+# DETECTION_LIFE should represent the first persistent
+# degradation detection for the ESN.
+
+detection_df = (
+    df[
+        [
+            ESN_COL,
+            DETECTION_COL
+        ]
+    ]
+    .dropna(subset=[DETECTION_COL])
+    .groupby(ESN_COL)[DETECTION_COL]
+    .min()
+    .reset_index()
+)
+
+detection_df = detection_df.rename(
+    columns={
+        DETECTION_COL: 'DETECTION_LIFE_PERCENT'
+    }
+)
+
+
+# ============================================================
+# 4. GET REPLACEMENT DATE FOR EACH ESN
+# ============================================================
+
+replacement_df = (
+    df[
+        [
+            ESN_COL,
+            REPLACEMENT_DATE_COL
+        ]
+    ]
+    .dropna(subset=[REPLACEMENT_DATE_COL])
+    .drop_duplicates(ESN_COL)
+)
+
+
+# ============================================================
+# 5. MERGE
+# ============================================================
+
+summary = detection_df.merge(
+    replacement_df,
+    on=ESN_COL,
+    how='left'
+)
+
+
+# ============================================================
+# 6. FOR EACH ESN, FIND THE LAST OBSERVATION
+#    BEFORE THE ACTUAL REPLACEMENT
+# ============================================================
+
+last_before_replacement = []
+
+for esn in summary[ESN_COL].unique():
+
+    replacement_row = summary[
+        summary[ESN_COL] == esn
+    ].iloc[0]
+
+    replacement_date = replacement_row[
+        REPLACEMENT_DATE_COL
+    ]
+
+    if pd.isna(replacement_date):
+        continue
+
+    esn_data = df[df[ESN_COL] == esn].copy()
+
+    esn_data = esn_data.sort_values(
+        DATETIME_COL
+    )
+
+    # Observations before replacement
+    before = esn_data[
+        esn_data[DATETIME_COL] <= replacement_date
+    ]
+
+    if before.empty:
+        continue
+
+    last_row = before.iloc[-1]
+
+    last_before_replacement.append({
+
+        ESN_COL: esn,
+
+        'LAST_DATETIME_BEFORE_REPLACEMENT':
+            last_row[DATETIME_COL],
+
+        'LAST_LIFE_PERCENT':
+            last_row[LIFE_COL],
+
+        'LAST_ROW_NUM':
+            last_row[ROW_COL]
+    })
+
+
+last_df = pd.DataFrame(
+    last_before_replacement
+)
+
+
+# ============================================================
+# 7. MERGE EVERYTHING
+# ============================================================
+
+summary = summary.merge(
+    last_df,
+    on=ESN_COL,
+    how='left'
+)
+
+
+# ============================================================
+# 8. CALCULATE LIFE REMAINING AT DETECTION
+# ============================================================
+
+summary['LIFE_REMAINING_AT_DETECTION'] = (
+    100 -
+    summary['DETECTION_LIFE_PERCENT']
+)
+
+
+# ============================================================
+# 9. CALCULATE DETECTION DATE
+# ============================================================
+
+detection_dates = []
+
+for _, row in summary.iterrows():
+
+    esn = row[ESN_COL]
+
+    detection_life = row[
+        'DETECTION_LIFE_PERCENT'
+    ]
+
+    esn_data = df[
+        df[ESN_COL] == esn
+    ].copy()
+
+    esn_data = esn_data.sort_values(
+        LIFE_COL
+    )
+
+    if esn_data.empty:
+        detection_dates.append(pd.NaT)
+        continue
+
+    # Find observation closest to detection LIFE %
+    idx = (
+        esn_data[LIFE_COL]
+        .sub(detection_life)
+        .abs()
+        .idxmin()
+    )
+
+    detection_dates.append(
+        esn_data.loc[idx, DATETIME_COL]
+    )
+
+
+summary['DETECTION_DATE'] = detection_dates
+
+
+# ============================================================
+# 10. CALCULATE TIME BETWEEN DETECTION AND REPLACEMENT
+# ============================================================
+
+summary['DAYS_BEFORE_REPLACEMENT'] = (
+    summary[REPLACEMENT_DATE_COL]
+    - summary['DETECTION_DATE']
+).dt.total_seconds() / (24 * 3600)
+
+
+# ============================================================
+# 11. PRINT RESULTS
+# ============================================================
+
+print()
+print("=" * 80)
+print("DETECTION VS ACTUAL BREATHER REPLACEMENT")
+print("=" * 80)
+
+print(
+    f"\nESNs with detection: "
+    f"{len(summary)}"
+)
+
+
+print(
+    "\nDetection life statistics:"
+)
+
+print(
+    summary[
+        'DETECTION_LIFE_PERCENT'
+    ].describe()
+)
+
+
+print(
+    "\nLife remaining at detection:"
+)
+
+print(
+    summary[
+        'LIFE_REMAINING_AT_DETECTION'
+    ].describe()
+)
+
+
+print(
+    "\nDays before actual replacement:"
+)
+
+print(
+    summary[
+        'DAYS_BEFORE_REPLACEMENT'
+    ].describe()
+)
+
+
+# ============================================================
+# 12. DISPLAY ESN-LEVEL RESULTS
+# ============================================================
+
+columns_to_show = [
+
+    ESN_COL,
+
+    'DETECTION_LIFE_PERCENT',
+
+    'LIFE_REMAINING_AT_DETECTION',
+
+    'DETECTION_DATE',
+
+    REPLACEMENT_DATE_COL,
+
+    'DAYS_BEFORE_REPLACEMENT',
+
+    'LAST_DATETIME_BEFORE_REPLACEMENT',
+
+    'LAST_LIFE_PERCENT'
+]
+
+
+print()
+print("=" * 80)
+print("ESN LEVEL RESULTS")
+print("=" * 80)
+
+display(
+    summary[
+        columns_to_show
+    ]
+    .sort_values(
+        'DETECTION_LIFE_PERCENT'
+    )
+)
+
+
+# ============================================================
+# 13. PLOT DETECTION LIFE DISTRIBUTION
+# ============================================================
+
+plt.figure(figsize=(10, 6))
+
+plt.hist(
+    summary['DETECTION_LIFE_PERCENT'].dropna(),
+    bins=20
+)
+
+plt.axvline(
+    summary[
+        'DETECTION_LIFE_PERCENT'
+    ].median(),
+    linestyle='--',
+    label='Median detection'
+)
+
+plt.xlabel(
+    'Detection Life (%)'
+)
+
+plt.ylabel(
+    'Number of ESNs'
+)
+
+plt.title(
+    'Distribution of First Persistent Degradation Detection'
+)
+
+plt.legend()
+
+plt.grid(
+    True,
+    alpha=0.3
+)
+
+plt.show()
+
+
+# ============================================================
+# 14. PLOT LIFE REMAINING AT DETECTION
+# ============================================================
+
+plt.figure(figsize=(10, 6))
+
+plt.hist(
+    summary[
+        'LIFE_REMAINING_AT_DETECTION'
+    ].dropna(),
+    bins=20
+)
+
+plt.xlabel(
+    'Life Remaining at Detection (%)'
+)
+
+plt.ylabel(
+    'Number of ESNs'
+)
+
+plt.title(
+    'Remaining Breather Life at Detection'
+)
+
+plt.grid(
+    True,
+    alpha=0.3
+)
+
+plt.show()
+
+
+# ============================================================
+# 15. PLOT DAYS BEFORE REPLACEMENT
+# ============================================================
+
+valid_days = summary[
+    'DAYS_BEFORE_REPLACEMENT'
+].dropna()
+
+plt.figure(figsize=(10, 6))
+
+plt.hist(
+    valid_days,
+    bins=20
+)
+
+plt.axvline(
+    valid_days.median(),
+    linestyle='--',
+    label='Median'
+)
+
+plt.xlabel(
+    'Days Between Detection and Replacement'
+)
+
+plt.ylabel(
+    'Number of ESNs'
+)
+
+plt.title(
+    'Warning Time Before Actual Breather Replacement'
+)
+
+plt.legend()
+
+plt.grid(
+    True,
+    alpha=0.3
+)
+
+plt.show()
+
+
+# ============================================================
+# 16. SAVE
+# ============================================================
+
+summary.to_csv(
+    'detection_vs_actual_replacement.csv',
+    index=False
+)
+
+print(
+    "\nSaved:"
+    " detection_vs_actual_replacement.csv"
+)
