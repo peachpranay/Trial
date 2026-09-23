@@ -1,0 +1,805 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.linear_model import LinearRegression
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+HEALTHY_START = 20
+HEALTHY_END = 60
+
+DETECTION_START = 60
+
+THRESHOLD_PERCENTILE = 95
+
+PERSISTENCE_WINDOW = 5
+PERSISTENCE_COUNT = 3
+
+REGULARIZATION = 1e-6
+
+
+# ============================================================
+# COPY DATA
+# ============================================================
+
+df = before_replacement.copy()
+
+df = df.sort_values(
+    ["ESN", "LIFE_PERCENT"]
+).reset_index(drop=True)
+
+
+print("Total ESNs:", df["ESN"].nunique())
+print("Total rows:", len(df))
+print("Features:", ema_columns)
+
+
+# ============================================================
+# STORAGE
+# ============================================================
+
+all_results = []
+
+summary_results = []
+
+
+# ============================================================
+# PROCESS EACH ESN INDEPENDENTLY
+# ============================================================
+
+for esn in df["ESN"].unique():
+
+    print("\n" + "=" * 70)
+    print(f"PROCESSING ESN: {esn}")
+    print("=" * 70)
+
+
+    # --------------------------------------------------------
+    # GET ESN DATA
+    # --------------------------------------------------------
+
+    esn_data = df[
+        df["ESN"] == esn
+    ].copy()
+
+    esn_data = esn_data.sort_values(
+        "LIFE_PERCENT"
+    ).reset_index(drop=True)
+
+
+    # --------------------------------------------------------
+    # HEALTHY DATA FOR THIS ESN
+    # --------------------------------------------------------
+
+    healthy_mask = (
+        (esn_data["LIFE_PERCENT"] >= HEALTHY_START) &
+        (esn_data["LIFE_PERCENT"] <= HEALTHY_END)
+    )
+
+    healthy_data = esn_data[
+        healthy_mask
+    ].copy()
+
+
+    # Need enough healthy observations
+    if len(healthy_data) < 20:
+
+        print(
+            f"Skipping ESN {esn}: "
+            f"only {len(healthy_data)} healthy observations"
+        )
+
+        continue
+
+
+    print(
+        f"Healthy observations: {len(healthy_data)}"
+    )
+
+
+    # ========================================================
+    # STEP 1
+    # FIT ESN-SPECIFIC EXPECTED TRAJECTORY
+    # ========================================================
+
+    """
+    For THIS ESN:
+
+        Feature = f(LIFE_PERCENT)
+
+    using only its healthy 20-60% data.
+
+    We use a separate linear model for every feature.
+    """
+
+    expected_models = {}
+
+
+    for col in ema_columns:
+
+        feature_data = healthy_data[
+            ["LIFE_PERCENT", col]
+        ].dropna()
+
+
+        if len(feature_data) < 10:
+
+            expected_models[col] = None
+            continue
+
+
+        X = feature_data[
+            ["LIFE_PERCENT"]
+        ].values
+
+        y = feature_data[
+            col
+        ].values
+
+
+        model = LinearRegression()
+
+        model.fit(X, y)
+
+        expected_models[col] = model
+
+
+    # ========================================================
+    # STEP 2
+    # CALCULATE EXPECTED VALUE FOR EVERY ROW
+    # ========================================================
+
+    for col in ema_columns:
+
+        expected_col = (
+            f"{col}_EXPECTED"
+        )
+
+        model = expected_models[col]
+
+
+        if model is None:
+
+            esn_data[
+                expected_col
+            ] = np.nan
+
+        else:
+
+            X_all = esn_data[
+                ["LIFE_PERCENT"]
+            ].values
+
+            esn_data[
+                expected_col
+            ] = model.predict(X_all)
+
+
+    # ========================================================
+    # STEP 3
+    # CALCULATE RESIDUALS
+    # ========================================================
+
+    residual_columns = []
+
+
+    for col in ema_columns:
+
+        residual_col = (
+            f"{col}_RESIDUAL"
+        )
+
+        esn_data[
+            residual_col
+        ] = (
+            esn_data[col]
+            -
+            esn_data[f"{col}_EXPECTED"]
+        )
+
+        residual_columns.append(
+            residual_col
+        )
+
+
+    # ========================================================
+    # STEP 4
+    # GET HEALTHY RESIDUALS FOR THIS ESN
+    # ========================================================
+
+    healthy_residuals = esn_data.loc[
+        healthy_mask,
+        residual_columns
+    ].dropna()
+
+
+    if len(healthy_residuals) < 20:
+
+        print(
+            f"Skipping ESN {esn}: "
+            f"not enough healthy residual data"
+        )
+
+        continue
+
+
+    # ========================================================
+    # STEP 5
+    # ESN-SPECIFIC HEALTHY RESIDUAL MEAN
+    # ========================================================
+
+    healthy_mean = (
+        healthy_residuals
+        .mean()
+        .values
+    )
+
+
+    # ========================================================
+    # STEP 6
+    # ESN-SPECIFIC HEALTHY COVARIANCE
+    # ========================================================
+
+    healthy_cov = (
+        healthy_residuals
+        .cov()
+        .values
+    )
+
+
+    # ========================================================
+    # STEP 7
+    # REGULARIZE COVARIANCE
+    # ========================================================
+
+    healthy_cov = (
+        healthy_cov
+        +
+        REGULARIZATION *
+        np.eye(
+            len(residual_columns)
+        )
+    )
+
+
+    # Use pseudo-inverse for stability
+    cov_inv = np.linalg.pinv(
+        healthy_cov
+    )
+
+
+    # ========================================================
+    # STEP 8
+    # CALCULATE MAHALANOBIS RESIDUAL
+    # ========================================================
+
+    def calculate_md(row):
+
+        x = (
+            row[residual_columns]
+            .astype(float)
+            .values
+        )
+
+
+        if np.any(
+            np.isnan(x)
+        ):
+
+            return np.nan
+
+
+        difference = (
+            x - healthy_mean
+        )
+
+
+        md_squared = (
+            difference.T
+            @ cov_inv
+            @ difference
+        )
+
+
+        md_squared = max(
+            md_squared,
+            0
+        )
+
+
+        return np.sqrt(
+            md_squared
+        )
+
+
+    esn_data[
+        "RESIDUAL_MAHALANOBIS"
+    ] = esn_data.apply(
+        calculate_md,
+        axis=1
+    )
+
+
+    # ========================================================
+    # STEP 9
+    # ESN-SPECIFIC HEALTHY MD DISTRIBUTION
+    # ========================================================
+
+    healthy_md = esn_data.loc[
+        healthy_mask,
+        "RESIDUAL_MAHALANOBIS"
+    ].dropna()
+
+
+    if len(healthy_md) < 10:
+
+        print(
+            f"Skipping ESN {esn}: "
+            f"not enough healthy MD values"
+        )
+
+        continue
+
+
+    # ========================================================
+    # STEP 10
+    # ESN-SPECIFIC 95% THRESHOLD
+    # ========================================================
+
+    esn_threshold = np.percentile(
+        healthy_md,
+        THRESHOLD_PERCENTILE
+    )
+
+
+    # ========================================================
+    # STEP 11
+    # FLAG ABOVE THRESHOLD
+    # ========================================================
+
+    esn_data[
+        "MD_ABOVE_THRESHOLD"
+    ] = (
+        esn_data[
+            "RESIDUAL_MAHALANOBIS"
+        ]
+        >
+        esn_threshold
+    )
+
+
+    # ========================================================
+    # STEP 12
+    # ONLY CONSIDER DETECTION AFTER 60%
+    # ========================================================
+
+    esn_data[
+        "MD_ABOVE_THRESHOLD"
+    ] = np.where(
+        esn_data["LIFE_PERCENT"]
+        >= DETECTION_START,
+
+        esn_data[
+            "MD_ABOVE_THRESHOLD"
+        ],
+
+        False
+    )
+
+
+    # ========================================================
+    # STEP 13
+    # PERSISTENCE
+    # ========================================================
+
+    """
+    Requirement:
+
+    At least 3 out of the last 5 observations
+    must be above this ESN's own threshold.
+    """
+
+    rolling_count = (
+        esn_data[
+            "MD_ABOVE_THRESHOLD"
+        ]
+        .astype(int)
+        .rolling(
+            window=PERSISTENCE_WINDOW,
+            min_periods=PERSISTENCE_WINDOW
+        )
+        .sum()
+    )
+
+
+    esn_data[
+        "PERSISTENT_ANOMALY"
+    ] = (
+        rolling_count
+        >= PERSISTENCE_COUNT
+    )
+
+
+    # ========================================================
+    # STEP 14
+    # FIRST PERSISTENT DETECTION
+    # ========================================================
+
+    detections = esn_data[
+        esn_data[
+            "PERSISTENT_ANOMALY"
+        ]
+    ]
+
+
+    if len(detections) > 0:
+
+        first_detection = (
+            detections.iloc[0]
+        )
+
+        detection_life = (
+            first_detection[
+                "LIFE_PERCENT"
+            ]
+        )
+
+        detection_md = (
+            first_detection[
+                "RESIDUAL_MAHALANOBIS"
+            ]
+        )
+
+    else:
+
+        detection_life = np.nan
+        detection_md = np.nan
+
+
+    # ========================================================
+    # STEP 15
+    # STORE ESN RESULTS
+    # ========================================================
+
+    esn_data[
+        "ESN_THRESHOLD"
+    ] = esn_threshold
+
+    esn_data[
+        "ESN_HEALTHY_MEAN_MD"
+    ] = healthy_md.mean()
+
+    esn_data[
+        "ESN_HEALTHY_MEDIAN_MD"
+    ] = healthy_md.median()
+
+
+    all_results.append(
+        esn_data
+    )
+
+
+    # ========================================================
+    # SUMMARY FOR THIS ESN
+    # ========================================================
+
+    summary_results.append({
+
+        "ESN": esn,
+
+        "HEALTHY_OBSERVATIONS":
+            len(healthy_residuals),
+
+        "HEALTHY_MD_MEAN":
+            healthy_md.mean(),
+
+        "HEALTHY_MD_MEDIAN":
+            healthy_md.median(),
+
+        "ESN_THRESHOLD":
+            esn_threshold,
+
+        "DETECTION_LIFE_PERCENT":
+            detection_life,
+
+        "DETECTION_MD":
+            detection_md,
+
+        "DETECTED":
+            not np.isnan(
+                detection_life
+            )
+
+    })
+
+
+    # ========================================================
+    # PRINT ESN RESULT
+    # ========================================================
+
+    print(
+        f"Healthy MD mean: "
+        f"{healthy_md.mean():.3f}"
+    )
+
+    print(
+        f"Healthy MD median: "
+        f"{healthy_md.median():.3f}"
+    )
+
+    print(
+        f"ESN 95% threshold: "
+        f"{esn_threshold:.3f}"
+    )
+
+    if not np.isnan(
+        detection_life
+    ):
+
+        print(
+            f"First persistent detection: "
+            f"{detection_life:.2f}% life"
+        )
+
+    else:
+
+        print(
+            "No persistent detection "
+            "after 60% life"
+        )
+
+
+# ============================================================
+# COMBINE ALL ESN DATA
+# ============================================================
+
+if len(all_results) > 0:
+
+    final_results = pd.concat(
+        all_results,
+        ignore_index=True
+    )
+
+else:
+
+    final_results = pd.DataFrame()
+
+
+# ============================================================
+# CREATE SUMMARY DATAFRAME
+# ============================================================
+
+summary = pd.DataFrame(
+    summary_results
+)
+
+
+# ============================================================
+# FINAL SUMMARY
+# ============================================================
+
+print("\n")
+print("=" * 70)
+print("FINAL SUMMARY")
+print("=" * 70)
+
+print(
+    "Total ESNs processed:",
+    len(summary)
+)
+
+print(
+    "ESNs with detection:",
+    summary["DETECTED"].sum()
+)
+
+print(
+    "ESNs without detection:",
+    (~summary["DETECTED"]).sum()
+)
+
+
+detected = summary[
+    summary["DETECTED"]
+]
+
+
+if len(detected) > 0:
+
+    print("\nDetection statistics:")
+
+    print(
+        "Median detection:",
+        detected[
+            "DETECTION_LIFE_PERCENT"
+        ].median()
+    )
+
+    print(
+        "Mean detection:",
+        detected[
+            "DETECTION_LIFE_PERCENT"
+        ].mean()
+    )
+
+    print(
+        "Minimum detection:",
+        detected[
+            "DETECTION_LIFE_PERCENT"
+        ].min()
+    )
+
+    print(
+        "Maximum detection:",
+        detected[
+            "DETECTION_LIFE_PERCENT"
+        ].max()
+    )
+
+
+# ============================================================
+# DISPLAY SUMMARY
+# ============================================================
+
+print("\n")
+print(
+    summary[
+        [
+            "ESN",
+            "HEALTHY_OBSERVATIONS",
+            "HEALTHY_MD_MEAN",
+            "HEALTHY_MD_MEDIAN",
+            "ESN_THRESHOLD",
+            "DETECTION_LIFE_PERCENT",
+            "DETECTION_MD",
+            "DETECTED"
+        ]
+    ].to_string(index=False)
+)
+
+
+# ============================================================
+# PLOT EVERY ESN
+# ============================================================
+
+for esn in final_results["ESN"].unique():
+
+    plot_data = final_results[
+        final_results["ESN"] == esn
+    ].sort_values(
+        "LIFE_PERCENT"
+    )
+
+
+    if plot_data.empty:
+        continue
+
+
+    threshold_value = (
+        plot_data[
+            "ESN_THRESHOLD"
+        ].iloc[0]
+    )
+
+
+    plt.figure(
+        figsize=(12, 5)
+    )
+
+
+    # --------------------------------------------------------
+    # RESIDUAL MAHALANOBIS
+    # --------------------------------------------------------
+
+    plt.plot(
+        plot_data[
+            "LIFE_PERCENT"
+        ],
+
+        plot_data[
+            "RESIDUAL_MAHALANOBIS"
+        ],
+
+        label="Residual Mahalanobis"
+    )
+
+
+    # --------------------------------------------------------
+    # ESN-SPECIFIC THRESHOLD
+    # --------------------------------------------------------
+
+    plt.axhline(
+        threshold_value,
+
+        linestyle="--",
+
+        label=(
+            f"ESN 95% threshold "
+            f"({threshold_value:.2f})"
+        )
+    )
+
+
+    # --------------------------------------------------------
+    # PERSISTENT ANOMALIES
+    # --------------------------------------------------------
+
+    persistent = plot_data[
+        plot_data[
+            "PERSISTENT_ANOMALY"
+        ]
+    ]
+
+
+    if not persistent.empty:
+
+        plt.scatter(
+            persistent[
+                "LIFE_PERCENT"
+            ],
+
+            persistent[
+                "RESIDUAL_MAHALANOBIS"
+            ],
+
+            label="Persistent anomaly"
+        )
+
+
+    # --------------------------------------------------------
+    # DETECTION START
+    # --------------------------------------------------------
+
+    plt.axvline(
+        DETECTION_START,
+
+        linestyle=":",
+
+        label="Detection region starts"
+    )
+
+
+    # --------------------------------------------------------
+    # BREATHER REPLACEMENT
+    # --------------------------------------------------------
+
+    plt.axvline(
+        100,
+
+        linestyle=":",
+
+        label="Breather replacement"
+    )
+
+
+    # --------------------------------------------------------
+    # LABELS
+    # --------------------------------------------------------
+
+    plt.title(
+        f"ESN {esn} - "
+        f"ESN-Specific Residual Mahalanobis"
+    )
+
+    plt.xlabel(
+        "Breather Life Percent (%)"
+    )
+
+    plt.ylabel(
+        "Residual Mahalanobis Distance"
+    )
+
+    plt.legend()
+
+    plt.grid(
+        True,
+        alpha=0.3
+    )
+
+    plt.tight_layout()
+
+    plt.show()
