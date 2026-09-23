@@ -1,0 +1,528 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+HEALTHY_START = 20
+HEALTHY_END = 60
+
+# Number of life-percent bins used to estimate fleet trajectory
+BIN_SIZE = 2
+
+# Threshold percentile
+THRESHOLD_PERCENTILE = 95
+
+# Persistence rule:
+# At least 3 of the last 5 observations must be above threshold
+PERSISTENCE_WINDOW = 5
+PERSISTENCE_COUNT = 3
+
+# Small regularization for covariance matrix
+REGULARIZATION = 1e-6
+
+
+# ============================================================
+# STEP 0: COPY DATA
+# ============================================================
+
+df = before_replacement.copy()
+
+# Make sure data is sorted correctly
+df = df.sort_values(["ESN", "LIFE_PERCENT"]).reset_index(drop=True)
+
+print("Number of ESNs:", df["ESN"].nunique())
+print("Number of rows:", len(df))
+print("Features:", ema_columns)
+
+
+# ============================================================
+# STEP 1: CREATE LIFE-PERCENT BINS
+# ============================================================
+
+# Example:
+# 20-22 -> 21
+# 22-24 -> 23
+# etc.
+
+df["LIFE_BIN"] = (
+    np.floor(df["LIFE_PERCENT"] / BIN_SIZE) * BIN_SIZE
+).astype(float)
+
+
+# ============================================================
+# STEP 2: BUILD POPULATION-LEVEL EXPECTED TRAJECTORY
+# ============================================================
+
+"""
+For every life-percent bin, calculate the median value
+of each feature across all ESNs.
+
+The median is used instead of mean because it is more
+robust to abnormal ESNs.
+"""
+
+trajectory = (
+    df.groupby("LIFE_BIN")[ema_columns]
+      .median()
+      .reset_index()
+      .sort_values("LIFE_BIN")
+)
+
+print("\nPopulation trajectory:")
+print(trajectory.head())
+
+
+# ============================================================
+# STEP 3: INTERPOLATE EXPECTED VALUES
+# ============================================================
+
+"""
+For every feature:
+
+Expected feature value =
+normal population behaviour at that LIFE_PERCENT
+"""
+
+for col in ema_columns:
+
+    valid = trajectory[[ "LIFE_BIN", col ]].dropna()
+
+    x = valid["LIFE_BIN"].values
+    y = valid[col].values
+
+    # Interpolate expected value
+    df[f"{col}_EXPECTED"] = np.interp(
+        df["LIFE_PERCENT"],
+        x,
+        y
+    )
+
+
+# ============================================================
+# STEP 4: CALCULATE RESIDUALS
+# ============================================================
+
+"""
+Residual = Actual - Expected
+
+A positive/negative residual means that the engine
+is behaving differently from the typical lifecycle
+behaviour at that same LIFE_PERCENT.
+"""
+
+residual_columns = []
+
+for col in ema_columns:
+
+    residual_col = f"{col}_RESIDUAL"
+
+    df[residual_col] = (
+        df[col] -
+        df[f"{col}_EXPECTED"]
+    )
+
+    residual_columns.append(residual_col)
+
+
+print("\nResidual columns:")
+print(residual_columns)
+
+
+# ============================================================
+# STEP 5: HEALTHY RESIDUAL DATA
+# ============================================================
+
+"""
+Use 20-60% life as the healthy reference period.
+
+IMPORTANT:
+
+We are NOT calculating a separate covariance for every
+life bin anymore.
+
+The lifecycle trend has already been removed.
+
+Therefore we can use one residual distribution.
+"""
+
+healthy_mask = (
+    (df["LIFE_PERCENT"] >= HEALTHY_START) &
+    (df["LIFE_PERCENT"] <= HEALTHY_END)
+)
+
+healthy_residuals = df.loc[
+    healthy_mask,
+    residual_columns
+].dropna()
+
+print("\nHealthy residual rows:", len(healthy_residuals))
+
+
+# ============================================================
+# STEP 6: HEALTHY RESIDUAL MEAN
+# ============================================================
+
+healthy_mean = healthy_residuals.mean().values
+
+
+# ============================================================
+# STEP 7: HEALTHY RESIDUAL COVARIANCE
+# ============================================================
+
+healthy_cov = healthy_residuals.cov().values
+
+print("\nCovariance matrix shape:", healthy_cov.shape)
+
+
+# ============================================================
+# STEP 8: REGULARIZE COVARIANCE MATRIX
+# ============================================================
+
+"""
+Covariance matrices can become singular or unstable,
+especially when features are highly correlated.
+
+Regularization makes the inverse more stable.
+"""
+
+healthy_cov_regularized = (
+    healthy_cov +
+    REGULARIZATION * np.eye(len(residual_columns))
+)
+
+cov_inv = np.linalg.pinv(
+    healthy_cov_regularized
+)
+
+
+# ============================================================
+# STEP 9: MAHALANOBIS FUNCTION
+# ============================================================
+
+def calculate_mahalanobis(row):
+
+    x = row[residual_columns].values.astype(float)
+
+    if np.any(np.isnan(x)):
+        return np.nan
+
+    diff = x - healthy_mean
+
+    md_squared = (
+        diff.T @ cov_inv @ diff
+    )
+
+    # Numerical protection
+    md_squared = max(md_squared, 0)
+
+    return np.sqrt(md_squared)
+
+
+# ============================================================
+# STEP 10: CALCULATE RESIDUAL MAHALANOBIS
+# ============================================================
+
+df["RESIDUAL_MAHALANOBIS"] = df.apply(
+    calculate_mahalanobis,
+    axis=1
+)
+
+
+# ============================================================
+# STEP 11: CALCULATE HEALTHY MAHALANOBIS THRESHOLD
+# ============================================================
+
+healthy_md = df.loc[
+    healthy_mask,
+    "RESIDUAL_MAHALANOBIS"
+].dropna()
+
+threshold = np.percentile(
+    healthy_md,
+    THRESHOLD_PERCENTILE
+)
+
+print("\n========================================")
+print("RESIDUAL MAHALANOBIS RESULTS")
+print("========================================")
+
+print(
+    f"{THRESHOLD_PERCENTILE}th percentile threshold:",
+    threshold
+)
+
+print(
+    "Healthy MD median:",
+    healthy_md.median()
+)
+
+print(
+    "Healthy MD mean:",
+    healthy_md.mean()
+)
+
+
+# ============================================================
+# STEP 12: INITIAL ANOMALY FLAG
+# ============================================================
+
+df["MD_ABOVE_THRESHOLD"] = (
+    df["RESIDUAL_MAHALANOBIS"] > threshold
+)
+
+
+# ============================================================
+# STEP 13: PERSISTENCE RULE
+# ============================================================
+
+"""
+Don't call degradation because of one isolated spike.
+
+Example:
+
+Observation:
+
+X
+X
+X
+X
+
+could be noise.
+
+Instead we require:
+
+3 out of the last 5 observations
+to be above the threshold.
+"""
+
+df["PERSISTENT_ANOMALY"] = False
+
+for esn in df["ESN"].unique():
+
+    mask = df["ESN"] == esn
+
+    esn_data = df.loc[mask].copy()
+
+    anomaly_values = (
+        esn_data["MD_ABOVE_THRESHOLD"]
+        .astype(int)
+    )
+
+    rolling_count = (
+        anomaly_values
+        .rolling(
+            window=PERSISTENCE_WINDOW,
+            min_periods=PERSISTENCE_WINDOW
+        )
+        .sum()
+    )
+
+    persistent = (
+        rolling_count >= PERSISTENCE_COUNT
+    )
+
+    df.loc[
+        esn_data.index,
+        "PERSISTENT_ANOMALY"
+    ] = persistent.values
+
+
+# ============================================================
+# STEP 14: FIND FIRST PERSISTENT DETECTION
+# ============================================================
+
+detection_results = []
+
+for esn in df["ESN"].unique():
+
+    esn_data = df[
+        df["ESN"] == esn
+    ].sort_values("LIFE_PERCENT")
+
+    detected = esn_data[
+        esn_data["PERSISTENT_ANOMALY"]
+    ]
+
+    if len(detected) > 0:
+
+        first_detection = detected.iloc[0]
+
+        detection_results.append({
+
+            "ESN": esn,
+
+            "DETECTION_LIFE_PERCENT":
+                first_detection["LIFE_PERCENT"],
+
+            "DETECTION_MD":
+                first_detection["RESIDUAL_MAHALANOBIS"]
+
+        })
+
+    else:
+
+        detection_results.append({
+
+            "ESN": esn,
+
+            "DETECTION_LIFE_PERCENT":
+                np.nan,
+
+            "DETECTION_MD":
+                np.nan
+
+        })
+
+
+detection_results = pd.DataFrame(
+    detection_results
+)
+
+
+# ============================================================
+# STEP 15: PRINT DETECTION RESULTS
+# ============================================================
+
+print("\n========================================")
+print("FIRST PERSISTENT DETECTION")
+print("========================================")
+
+print(
+    detection_results.head(20)
+)
+
+
+# ============================================================
+# STEP 16: PLOT EACH ESN
+# ============================================================
+
+for esn in df["ESN"].unique():
+
+    plot_data = df[
+        df["ESN"] == esn
+    ].sort_values("LIFE_PERCENT")
+
+    if plot_data.empty:
+        continue
+
+    plt.figure(figsize=(12, 5))
+
+    # Residual Mahalanobis
+    plt.plot(
+        plot_data["LIFE_PERCENT"],
+        plot_data["RESIDUAL_MAHALANOBIS"],
+        label="Residual Mahalanobis"
+    )
+
+    # Threshold
+    plt.axhline(
+        threshold,
+        linestyle="--",
+        label=f"{THRESHOLD_PERCENTILE}th percentile threshold"
+    )
+
+    # Highlight persistent anomalies
+    persistent_data = plot_data[
+        plot_data["PERSISTENT_ANOMALY"]
+    ]
+
+    if not persistent_data.empty:
+
+        plt.scatter(
+            persistent_data["LIFE_PERCENT"],
+            persistent_data["RESIDUAL_MAHALANOBIS"],
+            label="Persistent anomaly"
+        )
+
+    # Replacement reference
+    plt.axvline(
+        100,
+        linestyle=":",
+        label="Breather replacement"
+    )
+
+    plt.title(
+        f"Residual Mahalanobis Trajectory - ESN {esn}"
+    )
+
+    plt.xlabel("Life Percent (%)")
+
+    plt.ylabel(
+        "Residual Mahalanobis Distance"
+    )
+
+    plt.legend()
+
+    plt.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+
+    plt.show()
+
+
+# ============================================================
+# STEP 17: SUMMARY
+# ============================================================
+
+summary = detection_results.copy()
+
+summary["DETECTED"] = (
+    summary["DETECTION_LIFE_PERCENT"]
+    .notna()
+)
+
+print("\n========================================")
+print("SUMMARY")
+print("========================================")
+
+print(
+    "Total ESNs:",
+    len(summary)
+)
+
+print(
+    "ESNs with persistent detection:",
+    summary["DETECTED"].sum()
+)
+
+print(
+    "ESNs without detection:",
+    (~summary["DETECTED"]).sum()
+)
+
+
+# ============================================================
+# STEP 18: DISTRIBUTION OF DETECTION POINTS
+# ============================================================
+
+detected_life = summary.loc[
+    summary["DETECTED"],
+    "DETECTION_LIFE_PERCENT"
+]
+
+if len(detected_life) > 0:
+
+    print("\nDetection statistics:")
+
+    print(
+        "Median detection:",
+        detected_life.median()
+    )
+
+    print(
+        "Mean detection:",
+        detected_life.mean()
+    )
+
+    print(
+        "Minimum detection:",
+        detected_life.min()
+    )
+
+    print(
+        "Maximum detection:",
+        detected_life.max()
+    )
