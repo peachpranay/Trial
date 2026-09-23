@@ -1,0 +1,430 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+
+# ============================================================
+# 1. CHECK YOUR COLUMN NAMES
+# ============================================================
+
+print("final_results columns:")
+print(final_results.columns.tolist())
+
+print("\nBefore replacement columns:")
+print(before_replacement.columns.tolist())
+
+
+# ============================================================
+# 2. CREATE ESN-LEVEL DETECTION TABLE
+# ============================================================
+
+# We assume your final_results contains:
+# ESN
+# DETECTION_LIFE_PERCENT
+#
+# If your detection column has a different name,
+# change it below.
+
+detection_col = 'DETECTION_LIFE_PERCENT'
+
+detection_df = (
+    final_results[
+        ['ESN', detection_col]
+    ]
+    .dropna()
+    .drop_duplicates('ESN')
+    .copy()
+)
+
+detection_df = detection_df.rename(
+    columns={
+        detection_col: 'DETECTION_LIFE_PERCENT'
+    }
+)
+
+
+# ============================================================
+# 3. GET ACTUAL REPLACEMENT CYCLE FOR EACH ESN
+# ============================================================
+
+# IMPORTANT:
+# Change this column name if your dataset uses a different
+# name for the recorded replacement cycle.
+
+replacement_cycle_col = 'BREATHER_REPLACEMENT_CYCLES'
+
+
+# Check whether the column exists
+if replacement_cycle_col not in before_replacement.columns:
+
+    print(
+        f"\nERROR: '{replacement_cycle_col}' was not found."
+    )
+
+    print("\nPossible cycle-related columns:")
+    print([
+        c for c in before_replacement.columns
+        if 'cycle' in c.lower() or 'replace' in c.lower()
+    ])
+
+else:
+
+    replacement_df = (
+        before_replacement
+        .groupby('ESN')[replacement_cycle_col]
+        .first()
+        .reset_index()
+    )
+
+    replacement_df = replacement_df.rename(
+        columns={
+            replacement_cycle_col: 'REPLACEMENT_CYCLE'
+        }
+    )
+
+
+    # ========================================================
+    # 4. GET LAST OBSERVED CYCLE FOR EACH ESN
+    # ========================================================
+
+    # Change this if your actual cycle column has another name.
+
+    cycle_col = 'CYCLE'
+
+    if cycle_col not in before_replacement.columns:
+
+        print(
+            f"\nERROR: '{cycle_col}' was not found."
+        )
+
+        print("\nPossible cycle columns:")
+        print([
+            c for c in before_replacement.columns
+            if 'cycle' in c.lower()
+        ])
+
+    else:
+
+        last_cycle_df = (
+            before_replacement
+            .groupby('ESN')[cycle_col]
+            .max()
+            .reset_index()
+        )
+
+        last_cycle_df = last_cycle_df.rename(
+            columns={
+                cycle_col: 'LAST_RECORDED_CYCLE'
+            }
+        )
+
+
+        # ====================================================
+        # 5. COMBINE EVERYTHING
+        # ====================================================
+
+        test_df = detection_df.merge(
+            replacement_df,
+            on='ESN',
+            how='inner'
+        )
+
+        test_df = test_df.merge(
+            last_cycle_df,
+            on='ESN',
+            how='left'
+        )
+
+
+        # ====================================================
+        # 6. CALCULATE DETECTION CYCLE
+        # ====================================================
+
+        # Your LIFE_PERCENT is normalized approximately as:
+        #
+        #       cycle
+        # --------------------- × 100
+        #   replacement cycle
+        #
+        # Therefore:
+        #
+        # detection cycle =
+        # detection life % / 100 × replacement cycle
+
+        test_df['DETECTION_CYCLE'] = (
+            test_df['DETECTION_LIFE_PERCENT'] / 100
+        ) * test_df['REPLACEMENT_CYCLE']
+
+
+        # ====================================================
+        # 7. CALCULATE WARNING / LEAD TIME
+        # ====================================================
+
+        test_df['CYCLES_BEFORE_REPLACEMENT'] = (
+            test_df['REPLACEMENT_CYCLE']
+            - test_df['DETECTION_CYCLE']
+        )
+
+
+        test_df['PERCENT_BEFORE_REPLACEMENT'] = (
+            test_df['CYCLES_BEFORE_REPLACEMENT']
+            / test_df['REPLACEMENT_CYCLE']
+        ) * 100
+
+
+        # ====================================================
+        # 8. IMPORTANT: DETECTION RATIO
+        # ====================================================
+
+        test_df['DETECTION_TO_REPLACEMENT_RATIO'] = (
+            test_df['DETECTION_CYCLE']
+            / test_df['REPLACEMENT_CYCLE']
+        )
+
+
+        # ====================================================
+        # 9. PRINT SUMMARY
+        # ====================================================
+
+        print("\n")
+        print("=" * 70)
+        print("DETECTION vs ACTUAL REPLACEMENT TEST")
+        print("=" * 70)
+
+        print(
+            f"\nTotal ESNs tested: "
+            f"{len(test_df)}"
+        )
+
+        print(
+            f"\nDetection life %:"
+        )
+
+        print(
+            test_df['DETECTION_LIFE_PERCENT']
+            .describe()
+        )
+
+        print(
+            f"\nCycles before replacement:"
+        )
+
+        print(
+            test_df['CYCLES_BEFORE_REPLACEMENT']
+            .describe()
+        )
+
+        print(
+            f"\nPercentage before replacement:"
+        )
+
+        print(
+            test_df['PERCENT_BEFORE_REPLACEMENT']
+            .describe()
+        )
+
+
+        # ====================================================
+        # 10. SHOW INDIVIDUAL ESNs
+        # ====================================================
+
+        print("\n")
+        print("=" * 70)
+        print("ESN LEVEL RESULTS")
+        print("=" * 70)
+
+        display_columns = [
+            'ESN',
+            'DETECTION_LIFE_PERCENT',
+            'REPLACEMENT_CYCLE',
+            'DETECTION_CYCLE',
+            'CYCLES_BEFORE_REPLACEMENT',
+            'PERCENT_BEFORE_REPLACEMENT'
+        ]
+
+        print(
+            test_df[display_columns]
+            .sort_values('DETECTION_LIFE_PERCENT')
+            .to_string(index=False)
+        )
+
+
+        # ====================================================
+        # 11. TEST 1
+        # DETECTION % VS REPLACEMENT CYCLE
+        # ====================================================
+
+        plt.figure(figsize=(9, 6))
+
+        plt.scatter(
+            test_df['REPLACEMENT_CYCLE'],
+            test_df['DETECTION_LIFE_PERCENT'],
+            alpha=0.7
+        )
+
+        plt.xlabel('Actual Breather Replacement Cycle')
+        plt.ylabel('Detection Life (%)')
+
+        plt.title(
+            'Detection Life % vs Actual Breather Replacement Cycle'
+        )
+
+        plt.grid(True, alpha=0.3)
+
+        plt.show()
+
+
+        # ====================================================
+        # 12. TEST 2
+        # DETECTION CYCLE VS REPLACEMENT CYCLE
+        # ====================================================
+
+        plt.figure(figsize=(9, 6))
+
+        plt.scatter(
+            test_df['REPLACEMENT_CYCLE'],
+            test_df['DETECTION_CYCLE'],
+            alpha=0.7
+        )
+
+        # Ideal line:
+        # detection = replacement
+        min_val = min(
+            test_df['REPLACEMENT_CYCLE'].min(),
+            test_df['DETECTION_CYCLE'].min()
+        )
+
+        max_val = max(
+            test_df['REPLACEMENT_CYCLE'].max(),
+            test_df['DETECTION_CYCLE'].max()
+        )
+
+        plt.plot(
+            [min_val, max_val],
+            [min_val, max_val],
+            linestyle='--',
+            label='Detection = Replacement'
+        )
+
+        plt.xlabel('Actual Replacement Cycle')
+        plt.ylabel('Detected Degradation Cycle')
+
+        plt.title(
+            'Detected Degradation Cycle vs Actual Replacement Cycle'
+        )
+
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+
+        plt.show()
+
+
+        # ====================================================
+        # 13. TEST 3
+        # HOW MUCH WARNING DO WE GET?
+        # ====================================================
+
+        plt.figure(figsize=(10, 6))
+
+        plt.hist(
+            test_df['PERCENT_BEFORE_REPLACEMENT'],
+            bins=20
+        )
+
+        plt.xlabel(
+            'Percentage of Life Remaining at Detection (%)'
+        )
+
+        plt.ylabel('Number of ESNs')
+
+        plt.title(
+            'Warning Time Before Breather Replacement'
+        )
+
+        plt.grid(True, alpha=0.3)
+
+        plt.show()
+
+
+        # ====================================================
+        # 14. TEST 4
+        # DETECTION LIFE DISTRIBUTION
+        # ====================================================
+
+        plt.figure(figsize=(10, 6))
+
+        sns.histplot(
+            test_df['DETECTION_LIFE_PERCENT'],
+            bins=20,
+            kde=True
+        )
+
+        plt.axvline(
+            test_df['DETECTION_LIFE_PERCENT'].median(),
+            linestyle='--',
+            label='Median detection'
+        )
+
+        plt.xlabel('Detection Life (%)')
+        plt.ylabel('Number of ESNs')
+
+        plt.title(
+            'Distribution of Degradation Detection'
+        )
+
+        plt.legend()
+
+        plt.show()
+
+
+        # ====================================================
+        # 15. CORRELATION TEST
+        # ====================================================
+
+        correlation = test_df[
+            [
+                'REPLACEMENT_CYCLE',
+                'DETECTION_CYCLE'
+            ]
+        ].corr()
+
+        print("\n")
+        print("=" * 70)
+        print("CORRELATION")
+        print("=" * 70)
+
+        print(correlation)
+
+
+        # ====================================================
+        # 16. CORRELATION BETWEEN DETECTION % AND
+        # ACTUAL REPLACEMENT CYCLE
+        # ====================================================
+
+        corr = test_df[
+            'DETECTION_LIFE_PERCENT'
+        ].corr(
+            test_df['REPLACEMENT_CYCLE']
+        )
+
+        print(
+            "\nCorrelation between "
+            "Detection Life % and Replacement Cycle:",
+            round(corr, 4)
+        )
+
+
+        # ====================================================
+        # 17. SAVE RESULTS
+        # ====================================================
+
+        test_df.to_csv(
+            'detection_vs_replacement_test.csv',
+            index=False
+        )
+
+        print(
+            "\nResults saved to:"
+            " detection_vs_replacement_test.csv"
+        )
