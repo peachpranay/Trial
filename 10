@@ -1,0 +1,3464 @@
+# ============================================================
+# BREATHER DEGRADATION ANALYSIS
+# MAHALANOBIS + HEALTHY P95 MULTIPLIER + PERSISTENCE
+#
+# FINAL DEMO VERSION
+#
+# LOGIC:
+#
+# 1. Load takeoff data
+# 2. Load replacement data
+# 3. Keep ESNs with exactly ONE replacement event
+# 4. Merge replacement date
+# 5. Split BEFORE / AFTER replacement
+# 6. From BEFORE data, keep only max(Run_Number) == 1
+# 7. EMA(5), independently per ESN
+# 8. Normalize life to 0-100%
+# 9. Healthy baseline = 20-60% life
+# 10. Calculate ESN-specific Mahalanobis score
+# 11. Rolling Mahalanobis score
+# 12. Remove isolated sensor fluctuations
+# 13. Calculate healthy 95th percentile from 20-60%
+# 14. Multiply healthy P95 by threshold multiplier
+# 15. Detect 5 consecutive points above threshold
+# 16. Record first sustained crossing
+# 17. Record subsequent sustained crossings
+# 18. Calculate warning lead before replacement
+# 19. Generate presentation-ready plots
+# 20. Mark 100% life with thick black replacement line
+#
+# NO ISOLATION FOREST
+# NO NEW ML MODEL
+# NO AFTER-REPLACEMENT DATA IN MAHALANOBIS CALCULATION
+# ============================================================
+
+
+# ============================================================
+# 1. IMPORTS
+# ============================================================
+
+import os
+import warnings
+
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+
+# ============================================================
+# 2. CONFIGURATION
+# ============================================================
+
+# ------------------------------------------------------------
+# MAIN DATA
+# ------------------------------------------------------------
+
+DATA_PATH = "thedata.csv"
+
+
+# ------------------------------------------------------------
+# REPLACEMENT DATA
+# ------------------------------------------------------------
+
+REPLACEMENT_PATH = (
+    "/Volumes/desnprd/towit_dev/vol1/"
+    "Breather_Blockage/Breather Blockage/"
+    "Breather Replacement Data 15-05-2026.csv"
+)
+
+
+# ------------------------------------------------------------
+# OUTPUT DIRECTORY
+# ------------------------------------------------------------
+
+OUTPUT_DIR = "/tmp/breather_demo_results"
+
+PLOT_DIR = os.path.join(
+    OUTPUT_DIR,
+    "plots"
+)
+
+TABLE_DIR = os.path.join(
+    OUTPUT_DIR,
+    "tables"
+)
+
+os.makedirs(
+    PLOT_DIR,
+    exist_ok=True
+)
+
+os.makedirs(
+    TABLE_DIR,
+    exist_ok=True
+)
+
+
+# ============================================================
+# 3. METHOD PARAMETERS
+# ============================================================
+
+# EMA
+EMA_SPAN = 5
+
+
+# ------------------------------------------------------------
+# HEALTHY BASELINE
+# ------------------------------------------------------------
+
+BASELINE_START = 20
+BASELINE_END = 60
+
+
+# ------------------------------------------------------------
+# ROLLING MAHALANOBIS
+# ------------------------------------------------------------
+
+ROLLING_WINDOW = 5
+
+
+# ------------------------------------------------------------
+# SPIKE FILTER
+# ------------------------------------------------------------
+
+SPIKE_THRESHOLD = 5
+
+
+# ------------------------------------------------------------
+# HEALTHY PERCENTILE
+# ------------------------------------------------------------
+
+PERCENTILE = 95
+
+
+# ------------------------------------------------------------
+# HEALTHY P95 MULTIPLIER
+#
+# Example:
+#
+# Healthy P95 = 4
+# Multiplier = 1.5
+#
+# Threshold = 4 × 1.5
+#           = 6
+#
+# ------------------------------------------------------------
+
+THRESHOLD_MULTIPLIER = 1.5
+
+
+# ------------------------------------------------------------
+# PLOT / ANALYSIS START
+# ------------------------------------------------------------
+
+PLOT_START_LIFE = 20
+
+
+# ------------------------------------------------------------
+# PERSISTENCE
+#
+# Number of consecutive observations above threshold
+# required to confirm sustained degradation.
+# ------------------------------------------------------------
+
+SUSTAINED_POINTS = 5
+
+
+# ============================================================
+# 4. SENSOR PARAMETERS
+# ============================================================
+
+sensor_columns = [
+
+    "NH_PC",
+
+    "P25_PSI",
+
+    "T25_DEGC",
+
+    "OIP_PSI",
+
+    "OIP_PSI",
+
+    "OIQ_USQT",
+
+    "OIT_DEGC",
+
+    "OSDP_PSI",
+
+    "OSDP_EXP_PSI"
+
+]
+
+
+# Remove duplicate parameter names
+# while preserving original order.
+
+sensor_columns = list(
+    dict.fromkeys(
+        sensor_columns
+    )
+)
+
+
+print("=" * 70)
+print("SENSOR PARAMETERS")
+print("=" * 70)
+
+for i, col in enumerate(
+    sensor_columns,
+    start=1
+):
+
+    print(
+        f"{i}. {col}"
+    )
+
+
+# ============================================================
+# 5. LOAD MAIN DATA
+# ============================================================
+
+print("\n")
+print("=" * 70)
+print("LOADING MAIN DATA")
+print("=" * 70)
+
+df = pd.read_csv(
+    DATA_PATH
+)
+
+print(
+    f"Rows    : {len(df):,}"
+)
+
+print(
+    f"Columns : {len(df.columns)}"
+)
+
+
+# ============================================================
+# 6. VALIDATE MAIN DATA
+# ============================================================
+
+required_columns = [
+
+    "ESN",
+
+    "DATETIME",
+
+    "DATE",
+
+    "Run_Number"
+
+] + sensor_columns
+
+
+missing_columns = [
+
+    col
+
+    for col in required_columns
+
+    if col not in df.columns
+
+]
+
+
+if missing_columns:
+
+    raise ValueError(
+        "The following required columns "
+        "are missing from the main dataset:\n"
+        f"{missing_columns}"
+    )
+
+
+print(
+    "\nAll required main-data columns found."
+)
+
+
+# ============================================================
+# 7. CLEAN MAIN DATA
+# ============================================================
+
+df["ESN"] = pd.to_numeric(
+    df["ESN"],
+    errors="coerce"
+)
+
+df["Run_Number"] = pd.to_numeric(
+    df["Run_Number"],
+    errors="coerce"
+)
+
+df["DATETIME"] = pd.to_datetime(
+    df["DATETIME"],
+    errors="coerce"
+)
+
+df["DATE"] = pd.to_datetime(
+    df["DATE"],
+    errors="coerce"
+)
+
+
+for col in sensor_columns:
+
+    df[col] = pd.to_numeric(
+        df[col],
+        errors="coerce"
+    )
+
+
+df = df.dropna(
+    subset=[
+        "ESN",
+        "DATETIME"
+    ]
+).copy()
+
+
+print(
+    f"Rows after basic cleaning: "
+    f"{len(df):,}"
+)
+
+
+# ============================================================
+# 8. LOAD REPLACEMENT DATA
+# ============================================================
+
+print("\n")
+print("=" * 70)
+print("LOADING REPLACEMENT DATA")
+print("=" * 70)
+
+replacement = pd.read_csv(
+    REPLACEMENT_PATH
+)
+
+
+print(
+    f"Replacement rows: "
+    f"{len(replacement):,}"
+)
+
+
+# ============================================================
+# 9. VALIDATE REPLACEMENT DATA
+# ============================================================
+
+REPLACEMENT_DATE_COLUMN = (
+    "Confirmed Replacement Date"
+)
+
+
+required_replacement_columns = [
+
+    "ESN",
+
+    REPLACEMENT_DATE_COLUMN
+
+]
+
+
+missing_replacement = [
+
+    col
+
+    for col in required_replacement_columns
+
+    if col not in replacement.columns
+
+]
+
+
+if missing_replacement:
+
+    raise ValueError(
+        "The following columns are missing "
+        "from the replacement dataset:\n"
+        f"{missing_replacement}"
+    )
+
+
+# ============================================================
+# 10. CLEAN REPLACEMENT DATA
+# ============================================================
+
+replacement["ESN"] = pd.to_numeric(
+    replacement["ESN"],
+    errors="coerce"
+)
+
+
+replacement[
+    REPLACEMENT_DATE_COLUMN
+] = pd.to_datetime(
+    replacement[
+        REPLACEMENT_DATE_COLUMN
+    ],
+    errors="coerce"
+).dt.date
+
+
+replacement_valid = replacement[
+    replacement["ESN"].notna()
+    &
+    replacement[
+        REPLACEMENT_DATE_COLUMN
+    ].notna()
+].copy()
+
+
+# ============================================================
+# 11. FIND ESNs WITH EXACTLY ONE REPLACEMENT EVENT
+# ============================================================
+
+replacement_counts = (
+
+    replacement_valid
+
+    .groupby("ESN")[
+        REPLACEMENT_DATE_COLUMN
+    ]
+
+    .nunique()
+
+    .reset_index(
+        name="replacement_count"
+    )
+)
+
+
+single_replacement_esns = (
+
+    replacement_counts[
+
+        replacement_counts[
+            "replacement_count"
+        ] == 1
+
+    ]["ESN"]
+
+    .tolist()
+
+)
+
+
+print("\n")
+print("=" * 70)
+print("SINGLE-REPLACEMENT FILTER")
+print("=" * 70)
+
+print(
+    f"Total ESNs in replacement data : "
+    f"{replacement_counts['ESN'].nunique():,}"
+)
+
+print(
+    f"ESNs with exactly ONE replacement : "
+    f"{len(single_replacement_esns):,}"
+)
+
+
+replacement_single = replacement_valid[
+    replacement_valid["ESN"].isin(
+        single_replacement_esns
+    )
+].copy()
+
+
+# ============================================================
+# 12. KEEP ONE ROW PER ESN
+# ============================================================
+
+replacement_single = (
+
+    replacement_single[
+
+        [
+            "ESN",
+            REPLACEMENT_DATE_COLUMN
+        ]
+
+    ]
+
+    .drop_duplicates(
+        subset=["ESN"]
+    )
+
+    .copy()
+
+)
+
+
+# ============================================================
+# 13. MERGE REPLACEMENT DATE
+# ============================================================
+
+df_merged = df.merge(
+
+    replacement_single,
+
+    on="ESN",
+
+    how="inner"
+
+)
+
+
+print("\n")
+print("=" * 70)
+print("AFTER REPLACEMENT-DATA MATCHING")
+print("=" * 70)
+
+print(
+    f"Rows : {len(df_merged):,}"
+)
+
+print(
+    f"ESNs : {df_merged['ESN'].nunique():,}"
+)
+
+
+# ============================================================
+# 14. CREATE DATE FOR COMPARISON
+# ============================================================
+
+df_merged["DATE_ONLY"] = (
+
+    pd.to_datetime(
+        df_merged["DATETIME"]
+    )
+
+    .dt.date
+
+)
+
+
+# ============================================================
+# 15. SPLIT BEFORE / AFTER REPLACEMENT
+# ============================================================
+
+before_replacement = df_merged[
+    df_merged["DATE_ONLY"]
+    <=
+    df_merged[
+        REPLACEMENT_DATE_COLUMN
+    ]
+].copy()
+
+
+after_replacement = df_merged[
+    df_merged["DATE_ONLY"]
+    >
+    df_merged[
+        REPLACEMENT_DATE_COLUMN
+    ]
+].copy()
+
+
+print("\n")
+print("=" * 70)
+print("BEFORE / AFTER REPLACEMENT SPLIT")
+print("=" * 70)
+
+print(
+    f"BEFORE replacement rows : "
+    f"{len(before_replacement):,}"
+)
+
+print(
+    f"AFTER replacement rows  : "
+    f"{len(after_replacement):,}"
+)
+
+print(
+    f"BEFORE replacement ESNs : "
+    f"{before_replacement['ESN'].nunique():,}"
+)
+
+print(
+    f"AFTER replacement ESNs  : "
+    f"{after_replacement['ESN'].nunique():,}"
+)
+
+
+# ============================================================
+# 16. FIND ESNs WITH NO PREVIOUS SHOP VISIT
+# ============================================================
+
+max_run_per_esn = (
+
+    before_replacement
+
+    .groupby("ESN")[
+        "Run_Number"
+    ]
+
+    .max()
+
+    .reset_index(
+        name="max_run"
+    )
+
+)
+
+
+no_previous_shop_esns = (
+
+    max_run_per_esn[
+
+        max_run_per_esn[
+            "max_run"
+        ] == 1
+
+    ]["ESN"]
+
+    .tolist()
+
+)
+
+
+print("\n")
+print("=" * 70)
+print("NO-PREVIOUS-SHOP FILTER")
+print("=" * 70)
+
+print(
+    f"ESNs before Run_Number filter : "
+    f"{before_replacement['ESN'].nunique():,}"
+)
+
+print(
+    f"ESNs with max(Run_Number) == 1 : "
+    f"{len(no_previous_shop_esns):,}"
+)
+
+
+# ============================================================
+# 17. APPLY RUN_NUMBER FILTER
+# ============================================================
+
+before_replacement = before_replacement[
+    before_replacement["ESN"].isin(
+        no_previous_shop_esns
+    )
+].copy()
+
+
+after_replacement = after_replacement[
+    after_replacement["ESN"].isin(
+        no_previous_shop_esns
+    )
+].copy()
+
+
+print(
+    f"\nBEFORE rows after Run_Number filter : "
+    f"{len(before_replacement):,}"
+)
+
+print(
+    f"AFTER rows after Run_Number filter : "
+    f"{len(after_replacement):,}"
+)
+
+
+# ============================================================
+# 18. SORT BEFORE-REPLACEMENT DATA
+# ============================================================
+
+before_replacement["DATETIME"] = (
+    pd.to_datetime(
+        before_replacement["DATETIME"]
+    )
+)
+
+
+before_replacement = (
+
+    before_replacement
+
+    .sort_values(
+        [
+            "ESN",
+            "DATETIME"
+        ]
+    )
+
+    .reset_index(
+        drop=True
+    )
+
+)
+
+
+# ============================================================
+# 19. EMA(5)
+# ============================================================
+
+print("\n")
+print("=" * 70)
+print("CALCULATING EMA(5)")
+print("=" * 70)
+
+
+ema_columns = []
+
+
+for col in sensor_columns:
+
+    ema_col = (
+        f"{col}_EMA"
+    )
+
+    before_replacement[
+        ema_col
+    ] = (
+
+        before_replacement
+
+        .groupby("ESN")[col]
+
+        .transform(
+
+            lambda x:
+
+            x.ewm(
+                span=EMA_SPAN,
+                adjust=False
+            ).mean()
+
+        )
+
+    )
+
+    ema_columns.append(
+        ema_col
+    )
+
+
+print(
+    "EMA calculation complete."
+)
+
+
+# ============================================================
+# 20. NORMALIZE LIFE
+# ============================================================
+
+def normalize_life_score(data):
+
+    data = (
+
+        data
+
+        .sort_values(
+            [
+                "ESN",
+                "DATETIME"
+            ]
+        )
+
+        .copy()
+
+    )
+
+
+    data["ROW_NUM"] = (
+
+        data
+
+        .groupby("ESN")
+
+        .cumcount()
+
+    )
+
+
+    max_row = (
+
+        data
+
+        .groupby("ESN")[
+            "ROW_NUM"
+        ]
+
+        .transform("max")
+
+    )
+
+
+    max_row = max_row.replace(
+        0,
+        np.nan
+    )
+
+
+    data["LIFE_PERCENT"] = (
+
+        data["ROW_NUM"]
+
+        /
+
+        max_row
+
+        *
+
+        100
+
+    )
+
+
+    data["LIFE_PERCENT"] = (
+
+        data["LIFE_PERCENT"]
+
+        .fillna(0)
+
+    )
+
+
+    return data
+
+
+before_replacement = (
+    normalize_life_score(
+        before_replacement
+    )
+)
+
+
+# ============================================================
+# 21. MAHALANOBIS FUNCTION
+# ============================================================
+
+def compute_mahalanobis_scores(
+    data,
+    baseline_mask,
+    feature_columns
+):
+
+    baseline = (
+
+        data.loc[
+            baseline_mask,
+            feature_columns
+        ]
+
+        .dropna()
+
+    )
+
+
+    if len(baseline) < 10:
+
+        raise ValueError(
+            "Not enough healthy baseline "
+            "observations."
+        )
+
+
+    X_baseline = (
+        baseline
+        .values
+        .astype(float)
+    )
+
+
+    # --------------------------------------------------------
+    # Healthy mean
+    # --------------------------------------------------------
+
+    mean_base = np.mean(
+        X_baseline,
+        axis=0
+    )
+
+
+    # --------------------------------------------------------
+    # Healthy covariance
+    # --------------------------------------------------------
+
+    cov_base = np.cov(
+        X_baseline,
+        rowvar=False
+    )
+
+
+    cov_base = np.atleast_2d(
+        cov_base
+    )
+
+
+    # --------------------------------------------------------
+    # Numerical stabilization
+    # --------------------------------------------------------
+
+    cov_base = (
+
+        cov_base
+
+        +
+
+        np.eye(
+            cov_base.shape[0]
+        )
+
+        *
+
+        1e-8
+
+    )
+
+
+    # --------------------------------------------------------
+    # Pseudo-inverse
+    # --------------------------------------------------------
+
+    cov_inv = np.linalg.pinv(
+        cov_base
+    )
+
+
+    # --------------------------------------------------------
+    # Mahalanobis distance
+    # --------------------------------------------------------
+
+    scores = []
+
+
+    for _, row in data.iterrows():
+
+        x = (
+
+            row[
+                feature_columns
+            ]
+
+            .values
+
+            .astype(float)
+
+        )
+
+
+        if np.isnan(x).any():
+
+            scores.append(
+                np.nan
+            )
+
+            continue
+
+
+        difference = (
+            x - mean_base
+        )
+
+
+        score = np.sqrt(
+
+            difference.T
+
+            @
+
+            cov_inv
+
+            @
+
+            difference
+
+        )
+
+
+        scores.append(
+            score
+        )
+
+
+    return np.array(
+        scores
+    )
+
+
+# ============================================================
+# 22. PERSISTENCE FUNCTION
+# ============================================================
+
+def calculate_persistence(
+    above_threshold,
+    required_points
+):
+
+    values = (
+        above_threshold
+        .fillna(False)
+        .astype(bool)
+        .to_numpy()
+    )
+
+
+    persistence_count = np.zeros(
+        len(values),
+        dtype=int
+    )
+
+
+    current_count = 0
+
+
+    for i, value in enumerate(values):
+
+        if value:
+
+            current_count += 1
+
+        else:
+
+            current_count = 0
+
+
+        persistence_count[i] = (
+            current_count
+        )
+
+
+    sustained = (
+
+        persistence_count
+
+        >=
+
+        required_points
+
+    )
+
+
+    # --------------------------------------------------------
+    # Start of every persistent sequence
+    # --------------------------------------------------------
+
+    sustained_start = np.zeros(
+        len(values),
+        dtype=bool
+    )
+
+
+    for i in range(len(values)):
+
+        if not sustained[i]:
+
+            continue
+
+
+        if i == 0:
+
+            sustained_start[i] = True
+
+        elif not sustained[i - 1]:
+
+            sustained_start[i] = True
+
+
+    return (
+
+        persistence_count,
+
+        sustained,
+
+        sustained_start
+
+    )
+
+
+# ============================================================
+# 23. PROCESS EACH ESN INDEPENDENTLY
+# ============================================================
+
+print("\n")
+print("=" * 70)
+print("MAHALANOBIS ANALYSIS")
+print("=" * 70)
+
+print(
+    f"Healthy baseline : "
+    f"{BASELINE_START}-{BASELINE_END}%"
+)
+
+print(
+    f"Healthy percentile : "
+    f"{PERCENTILE}th percentile"
+)
+
+print(
+    f"Threshold multiplier : "
+    f"{THRESHOLD_MULTIPLIER}x"
+)
+
+print(
+    f"Persistence requirement : "
+    f"{SUSTAINED_POINTS} consecutive points"
+)
+
+
+all_results = []
+
+summary_results = []
+
+
+analysis_esns = (
+
+    before_replacement[
+        "ESN"
+    ]
+
+    .dropna()
+
+    .unique()
+
+)
+
+
+print(
+    f"\nESNs entering Mahalanobis analysis: "
+    f"{len(analysis_esns):,}"
+)
+
+
+# ============================================================
+# 24. ESN LOOP
+# ============================================================
+
+for esn in analysis_esns:
+
+
+    # --------------------------------------------------------
+    # Get this ESN only
+    # --------------------------------------------------------
+
+    df_esn = (
+
+        before_replacement[
+
+            before_replacement[
+                "ESN"
+            ] == esn
+
+        ]
+
+        .copy()
+
+        .sort_values(
+            "DATETIME"
+        )
+
+        .reset_index(
+            drop=True
+        )
+
+    )
+
+
+    # Need enough observations
+
+    if len(df_esn) < 20:
+
+        continue
+
+
+    # --------------------------------------------------------
+    # HEALTHY BASELINE
+    # 20-60%
+    # --------------------------------------------------------
+
+    baseline_mask = (
+
+        (
+
+            df_esn[
+                "LIFE_PERCENT"
+            ]
+
+            >=
+
+            BASELINE_START
+
+        )
+
+        &
+
+        (
+
+            df_esn[
+                "LIFE_PERCENT"
+            ]
+
+            <=
+
+            BASELINE_END
+
+        )
+
+    )
+
+
+    baseline_count = (
+        baseline_mask.sum()
+    )
+
+
+    if baseline_count < 10:
+
+        continue
+
+
+    # --------------------------------------------------------
+    # MAHALANOBIS
+    # --------------------------------------------------------
+
+    df_esn[
+        "MAHALANOBIS_SCORE"
+    ] = (
+
+        compute_mahalanobis_scores(
+
+            df_esn,
+
+            baseline_mask,
+
+            ema_columns
+
+        )
+
+    )
+
+
+    # --------------------------------------------------------
+    # ROLLING MAHALANOBIS
+    # --------------------------------------------------------
+
+    df_esn[
+        "ROLLING_SCORE"
+    ] = (
+
+        df_esn[
+            "MAHALANOBIS_SCORE"
+        ]
+
+        .rolling(
+
+            window=ROLLING_WINDOW,
+
+            min_periods=1
+
+        )
+
+        .mean()
+
+    )
+
+
+    # ========================================================
+    # ISOLATED SPIKE FILTER
+    # ========================================================
+
+    local_mean = (
+
+        df_esn[
+            "MAHALANOBIS_SCORE"
+        ]
+
+        .rolling(
+
+            window=ROLLING_WINDOW,
+
+            min_periods=1
+
+        )
+
+        .mean()
+
+    )
+
+
+    local_std = (
+
+        df_esn[
+            "MAHALANOBIS_SCORE"
+        ]
+
+        .rolling(
+
+            window=ROLLING_WINDOW,
+
+            min_periods=1
+
+        )
+
+        .std()
+
+        .fillna(0)
+
+    )
+
+
+    spike_limit = (
+
+        local_mean
+
+        +
+
+        SPIKE_THRESHOLD
+
+        *
+
+        local_std
+
+    )
+
+
+    df_esn[
+        "IS_SPIKE"
+    ] = (
+
+        df_esn[
+            "MAHALANOBIS_SCORE"
+        ]
+
+        >
+
+        spike_limit
+
+    )
+
+
+    # --------------------------------------------------------
+    # CLEAN MAHALANOBIS
+    # --------------------------------------------------------
+
+    df_esn[
+        "MAHALANOBIS_SCORE_CLEAN"
+    ] = (
+
+        df_esn[
+            "MAHALANOBIS_SCORE"
+        ]
+
+        .where(
+            ~df_esn[
+                "IS_SPIKE"
+            ]
+        )
+
+    )
+
+
+    # --------------------------------------------------------
+    # CLEAN ROLLING SCORE
+    # --------------------------------------------------------
+
+    df_esn[
+        "ROLLING_SCORE_CLEAN"
+    ] = (
+
+        df_esn[
+            "MAHALANOBIS_SCORE_CLEAN"
+        ]
+
+        .rolling(
+
+            window=ROLLING_WINDOW,
+
+            min_periods=1
+
+        )
+
+        .mean()
+
+    )
+
+
+    # ========================================================
+    # HEALTHY 95TH PERCENTILE
+    # ========================================================
+    #
+    # IMPORTANT:
+    #
+    # The P95 is calculated ONLY from healthy 20-60% data.
+    #
+    # Late-life degradation does NOT influence the baseline
+    # threshold.
+    # ========================================================
+
+    healthy_rolling = (
+
+        df_esn.loc[
+            baseline_mask,
+            "ROLLING_SCORE_CLEAN"
+        ]
+
+        .dropna()
+
+    )
+
+
+    if len(healthy_rolling) < 10:
+
+        continue
+
+
+    healthy_p95 = np.percentile(
+
+        healthy_rolling,
+
+        PERCENTILE
+
+    )
+
+
+    # ========================================================
+    # MULTIPLIED THRESHOLD
+    # ========================================================
+    #
+    # Threshold =
+    #
+    # Healthy P95 × multiplier
+    #
+    # Example:
+    #
+    # Healthy P95 = 4
+    # Multiplier = 1.5
+    #
+    # Threshold = 6
+    # ========================================================
+
+    threshold = (
+
+        healthy_p95
+
+        *
+
+        THRESHOLD_MULTIPLIER
+
+    )
+
+
+    df_esn[
+        "HEALTHY_P95"
+    ] = healthy_p95
+
+
+    df_esn[
+        "THRESHOLD_MULTIPLIER"
+    ] = THRESHOLD_MULTIPLIER
+
+
+    df_esn[
+        "DEGRADATION_THRESHOLD"
+    ] = threshold
+
+
+    # ========================================================
+    # ABOVE THRESHOLD
+    # ========================================================
+
+    df_esn[
+        "ABOVE_THRESHOLD"
+    ] = (
+
+        (
+
+            df_esn[
+                "ROLLING_SCORE_CLEAN"
+            ]
+
+            >
+
+            threshold
+
+        )
+
+        &
+
+        (
+
+            df_esn[
+                "LIFE_PERCENT"
+            ]
+
+            >=
+
+            PLOT_START_LIFE
+
+        )
+
+    )
+
+
+    # ========================================================
+    # PERSISTENCE
+    # ========================================================
+
+    (
+        persistence_count,
+
+        sustained,
+
+        sustained_start
+
+    ) = calculate_persistence(
+
+        df_esn[
+            "ABOVE_THRESHOLD"
+        ],
+
+        SUSTAINED_POINTS
+
+    )
+
+
+    df_esn[
+        "PERSISTENCE_COUNT"
+    ] = persistence_count
+
+
+    df_esn[
+        "SUSTAINED_DEGRADATION"
+    ] = sustained
+
+
+    df_esn[
+        "SUSTAINED_CROSSING_START"
+    ] = sustained_start
+
+
+    # ========================================================
+    # FIRST CONFIRMED SUSTAINED DETECTION
+    # ========================================================
+    #
+    # Example:
+    #
+    # Above threshold:
+    #
+    # False True True True True True
+    #
+    # Persistence:
+    #
+    # 0     1    2    3    4    5
+    #
+    # The detection is CONFIRMED at persistence = 5.
+    # ========================================================
+
+    detection_rows = df_esn[
+        df_esn[
+            "SUSTAINED_DEGRADATION"
+        ]
+    ]
+
+
+    if not detection_rows.empty:
+
+        first_detection_position = (
+
+            detection_rows.index[0]
+
+        )
+
+
+        first_detection_row = (
+
+            df_esn.loc[
+                first_detection_position
+            ]
+
+        )
+
+
+        first_detection_life = (
+
+            first_detection_row[
+                "LIFE_PERCENT"
+            ]
+
+        )
+
+
+        first_detection_datetime = (
+
+            first_detection_row[
+                "DATETIME"
+            ]
+
+        )
+
+
+        # Start of the 5-point persistent run
+
+        first_run_start_position = (
+
+            first_detection_position
+
+            -
+
+            SUSTAINED_POINTS
+
+            +
+
+            1
+
+        )
+
+
+        if first_run_start_position >= 0:
+
+            first_run_start_row = (
+
+                df_esn.iloc[
+                    first_run_start_position
+                ]
+
+            )
+
+
+            first_crossing_start_life = (
+
+                first_run_start_row[
+                    "LIFE_PERCENT"
+                ]
+
+            )
+
+        else:
+
+            first_crossing_start_life = np.nan
+
+
+    else:
+
+        first_detection_life = np.nan
+
+        first_detection_datetime = pd.NaT
+
+        first_crossing_start_life = np.nan
+
+
+    # ========================================================
+    # SUBSEQUENT SUSTAINED CROSSINGS
+    # ========================================================
+
+    crossing_start_rows = df_esn[
+        df_esn[
+            "SUSTAINED_CROSSING_START"
+        ]
+    ]
+
+
+    subsequent_crossing_lives = []
+
+
+    first_crossing_already_found = False
+
+
+    for idx in crossing_start_rows.index:
+
+        current_life = (
+
+            df_esn.loc[
+                idx,
+                "LIFE_PERCENT"
+            ]
+
+        )
+
+
+        if not first_crossing_already_found:
+
+            first_crossing_already_found = True
+
+            continue
+
+
+        subsequent_crossing_lives.append(
+            current_life
+        )
+
+
+    if len(subsequent_crossing_lives) > 0:
+
+        subsequent_crossings_text = (
+
+            ", ".join(
+
+                [
+
+                    f"{x:.1f}%"
+
+                    for x
+                    in subsequent_crossing_lives
+
+                ]
+
+            )
+
+        )
+
+    else:
+
+        subsequent_crossings_text = ""
+
+
+    # ========================================================
+    # NUMBER OF SUSTAINED PERIODS
+    # ========================================================
+
+    number_of_sustained_periods = (
+
+        int(
+            crossing_start_rows.shape[0]
+        )
+
+    )
+
+
+    # ========================================================
+    # LATE-LIFE STATISTICS
+    # ========================================================
+
+    late_data = df_esn[
+        df_esn[
+            "LIFE_PERCENT"
+        ]
+        >= 80
+    ]
+
+
+    if not late_data.empty:
+
+        late_mean = (
+
+            late_data[
+                "ROLLING_SCORE_CLEAN"
+            ]
+
+            .mean()
+
+        )
+
+
+        late_median = (
+
+            late_data[
+                "ROLLING_SCORE_CLEAN"
+            ]
+
+            .median()
+
+        )
+
+    else:
+
+        late_mean = np.nan
+
+        late_median = np.nan
+
+
+    # ========================================================
+    # HEALTHY BASELINE STATISTICS
+    # ========================================================
+
+    healthy_mean = (
+        healthy_rolling.mean()
+    )
+
+
+    healthy_median = (
+        healthy_rolling.median()
+    )
+
+
+    # ========================================================
+    # LATE / HEALTHY RATIO
+    # ========================================================
+
+    if (
+
+        not pd.isna(
+            healthy_mean
+        )
+
+        and
+
+        healthy_mean > 0
+
+    ):
+
+        late_to_healthy_ratio = (
+
+            late_mean
+
+            /
+
+            healthy_mean
+
+        )
+
+    else:
+
+        late_to_healthy_ratio = np.nan
+
+
+    # ========================================================
+    # MAXIMUM SCORE
+    # ========================================================
+
+    maximum_score = (
+
+        df_esn[
+            "MAHALANOBIS_SCORE"
+        ]
+
+        .max()
+
+    )
+
+
+    maximum_clean_score = (
+
+        df_esn[
+            "ROLLING_SCORE_CLEAN"
+        ]
+
+        .max()
+
+    )
+
+
+    # ========================================================
+    # WARNING LEAD
+    # ========================================================
+    #
+    # Replacement = 100%
+    #
+    # Warning lead =
+    #
+    # 100 - detection life
+    # ========================================================
+
+    if not pd.isna(
+        first_detection_life
+    ):
+
+        warning_lead = (
+
+            100
+
+            -
+
+            first_detection_life
+
+        )
+
+    else:
+
+        warning_lead = np.nan
+
+
+    # ========================================================
+    # REPLACEMENT DATE
+    # ========================================================
+
+    replacement_date = (
+
+        df_esn[
+            REPLACEMENT_DATE_COLUMN
+        ]
+
+        .iloc[0]
+
+    )
+
+
+    # ========================================================
+    # SUMMARY ROW
+    # ========================================================
+
+    summary_results.append({
+
+        "ESN":
+            int(esn),
+
+        "Observations":
+            len(df_esn),
+
+        "Baseline_Observations":
+            baseline_count,
+
+        "Healthy_Mean":
+            healthy_mean,
+
+        "Healthy_Median":
+            healthy_median,
+
+        "Healthy_P95":
+            healthy_p95,
+
+        "Threshold_Multiplier":
+            THRESHOLD_MULTIPLIER,
+
+        "Degradation_Threshold":
+            threshold,
+
+        "First_Crossing_Start_Life_%":
+            first_crossing_start_life,
+
+        "First_Sustained_Detection_Life_%":
+            first_detection_life,
+
+        "Warning_Lead_%":
+            warning_lead,
+
+        "First_Sustained_Detection_Date":
+            first_detection_datetime,
+
+        "Subsequent_Crossings":
+            subsequent_crossings_text,
+
+        "Number_Sustained_Periods":
+            number_of_sustained_periods,
+
+        "Late_Life_Mean":
+            late_mean,
+
+        "Late_Life_Median":
+            late_median,
+
+        "Late_to_Healthy_Ratio":
+            late_to_healthy_ratio,
+
+        "Maximum_Raw_Mahalanobis":
+            maximum_score,
+
+        "Maximum_Clean_Rolling":
+            maximum_clean_score,
+
+        "Sustained_Detection":
+            not detection_rows.empty,
+
+        "Replacement_Date":
+            replacement_date
+
+    })
+
+
+    # Store complete ESN result
+
+    all_results.append(
+        df_esn
+    )
+
+
+# ============================================================
+# 25. COMBINE RESULTS
+# ============================================================
+
+if not all_results:
+
+    raise ValueError(
+        "No ESNs were successfully processed."
+    )
+
+
+anomaly_results = pd.concat(
+
+    all_results,
+
+    ignore_index=True
+
+)
+
+
+summary_df = pd.DataFrame(
+    summary_results
+)
+
+
+# ============================================================
+# 26. SAVE COMPLETE SCORED DATA
+# ============================================================
+
+scored_data_path = os.path.join(
+
+    TABLE_DIR,
+
+    "mahalanobis_scored_data.csv"
+
+)
+
+
+anomaly_results.to_csv(
+
+    scored_data_path,
+
+    index=False
+
+)
+
+
+# ============================================================
+# 27. SAVE SUMMARY
+# ============================================================
+
+summary_path = os.path.join(
+
+    TABLE_DIR,
+
+    "ESN_summary.csv"
+
+)
+
+
+summary_df.to_csv(
+
+    summary_path,
+
+    index=False
+
+)
+
+
+# ============================================================
+# 28. SAVE BEFORE / AFTER DATA
+# ============================================================
+
+before_path = os.path.join(
+
+    TABLE_DIR,
+
+    "before_replacement.csv"
+
+)
+
+
+after_path = os.path.join(
+
+    TABLE_DIR,
+
+    "after_replacement.csv"
+
+)
+
+
+before_replacement.to_csv(
+
+    before_path,
+
+    index=False
+
+)
+
+
+after_replacement.to_csv(
+
+    after_path,
+
+    index=False
+
+)
+
+
+# ============================================================
+# 29. SAVE PERSISTENCE SUMMARY
+# ============================================================
+
+persistence_summary = summary_df[
+
+    [
+
+        "ESN",
+
+        "Healthy_P95",
+
+        "Threshold_Multiplier",
+
+        "Degradation_Threshold",
+
+        "First_Crossing_Start_Life_%",
+
+        "First_Sustained_Detection_Life_%",
+
+        "Warning_Lead_%",
+
+        "Subsequent_Crossings",
+
+        "Number_Sustained_Periods",
+
+        "Sustained_Detection",
+
+        "Replacement_Date"
+
+    ]
+
+].copy()
+
+
+persistence_summary_path = os.path.join(
+
+    TABLE_DIR,
+
+    "Persistence_Summary.csv"
+
+)
+
+
+persistence_summary.to_csv(
+
+    persistence_summary_path,
+
+    index=False
+
+)
+
+
+# ============================================================
+# 30. FINAL COUNTS
+# ============================================================
+
+print("\n")
+print("=" * 70)
+print("ANALYSIS COUNTS")
+print("=" * 70)
+
+print(
+    f"Original ESNs                    : "
+    f"{df['ESN'].nunique():,}"
+)
+
+print(
+    f"Single-replacement ESNs          : "
+    f"{len(single_replacement_esns):,}"
+)
+
+print(
+    f"Before replacement ESNs          : "
+    f"{before_replacement['ESN'].nunique():,}"
+)
+
+print(
+    f"After replacement ESNs           : "
+    f"{after_replacement['ESN'].nunique():,}"
+)
+
+print(
+    f"ESNs with max Run_Number == 1    : "
+    f"{len(no_previous_shop_esns):,}"
+)
+
+print(
+    f"ESNs successfully analysed       : "
+    f"{summary_df['ESN'].nunique():,}"
+)
+
+
+# ============================================================
+# 31. DISPLAY SUMMARY
+# ============================================================
+
+display(
+    summary_df.head(20)
+)
+
+
+# ============================================================
+# 32. PLOT STYLE
+# ============================================================
+
+plt.rcParams.update({
+
+    "figure.dpi": 120,
+
+    "savefig.dpi": 300,
+
+    "font.size": 11,
+
+    "axes.titlesize": 16,
+
+    "axes.labelsize": 12,
+
+    "legend.fontsize": 10,
+
+    "axes.spines.top": False,
+
+    "axes.spines.right": False
+
+})
+
+
+# ============================================================
+# 33. SELECT DEMO ESNs
+# ============================================================
+
+candidate_summary = summary_df[
+    summary_df[
+        "Sustained_Detection"
+    ]
+].copy()
+
+
+if len(candidate_summary) >= 5:
+
+    candidate_summary = (
+        candidate_summary
+        .sort_values(
+            "First_Sustained_Detection_Life_%"
+        )
+    )
+
+else:
+
+    candidate_summary = summary_df[
+        summary_df[
+            "Late_to_Healthy_Ratio"
+        ].notna()
+    ].copy()
+
+    candidate_summary = (
+        candidate_summary
+        .sort_values(
+            "Late_to_Healthy_Ratio",
+            ascending=False
+        )
+    )
+
+
+# ============================================================
+# 34. SELECT REPRESENTATIVE ESNs
+# ============================================================
+
+if len(candidate_summary) > 0:
+
+    candidate_summary = (
+        candidate_summary
+        .reset_index(drop=True)
+    )
+
+
+    if len(candidate_summary) <= 5:
+
+        demo_esns = (
+            candidate_summary[
+                "ESN"
+            ]
+            .tolist()
+        )
+
+    else:
+
+        positions = np.linspace(
+
+            0,
+
+            len(candidate_summary) - 1,
+
+            5
+
+        ).astype(int)
+
+
+        demo_esns = (
+            candidate_summary
+            .iloc[positions][
+                "ESN"
+            ]
+            .tolist()
+        )
+
+else:
+
+    demo_esns = []
+
+
+print("\n")
+print("=" * 70)
+print("DEMO ESNs")
+print("=" * 70)
+
+print(
+    "Selected using sustained trajectory behaviour."
+)
+
+print(
+    "Selection is NOT based purely on maximum Mahalanobis."
+)
+
+print(
+    demo_esns
+)
+
+
+# ============================================================
+# 35. DISPLAY DEMO TABLE
+# ============================================================
+
+if len(demo_esns) > 0:
+
+    display(
+
+        summary_df[
+            summary_df[
+                "ESN"
+            ].isin(
+                demo_esns
+            )
+        ]
+
+        [
+
+            [
+
+                "ESN",
+
+                "Healthy_Mean",
+
+                "Healthy_P95",
+
+                "Threshold_Multiplier",
+
+                "Degradation_Threshold",
+
+                "First_Crossing_Start_Life_%",
+
+                "First_Sustained_Detection_Life_%",
+
+                "Warning_Lead_%",
+
+                "Subsequent_Crossings",
+
+                "Number_Sustained_Periods",
+
+                "Sustained_Detection"
+
+            ]
+
+        ]
+
+    )
+
+
+# ============================================================
+# 36. ESN PLOT FUNCTION
+# ============================================================
+
+def create_esn_plot(
+    esn,
+    data,
+    summary,
+    output_directory
+):
+
+
+    plot_data = (
+
+        data[
+            data[
+                "ESN"
+            ] == esn
+        ]
+
+        .copy()
+
+        .sort_values(
+            "LIFE_PERCENT"
+        )
+
+    )
+
+
+    plot_data = plot_data[
+        plot_data[
+            "LIFE_PERCENT"
+        ]
+        >= PLOT_START_LIFE
+    ].copy()
+
+
+    if plot_data.empty:
+
+        return None
+
+
+    # --------------------------------------------------------
+    # Summary row
+    # --------------------------------------------------------
+
+    row = (
+
+        summary[
+            summary[
+                "ESN"
+            ] == esn
+        ]
+
+        .iloc[0]
+
+    )
+
+
+    threshold = row[
+        "Degradation_Threshold"
+    ]
+
+
+    healthy_p95 = row[
+        "Healthy_P95"
+    ]
+
+
+    detection_life = row[
+        "First_Sustained_Detection_Life_%"
+    ]
+
+
+    # ========================================================
+    # FIGURE
+    # ========================================================
+
+    fig, ax = plt.subplots(
+
+        figsize=(13, 6.5)
+
+    )
+
+
+    # ========================================================
+    # HEALTHY BASELINE
+    # ========================================================
+
+    ax.axvspan(
+
+        BASELINE_START,
+
+        BASELINE_END,
+
+        alpha=0.10,
+
+        label="Healthy baseline (20–60%)"
+
+    )
+
+
+    # ========================================================
+    # RAW MAHALANOBIS
+    # ========================================================
+
+    ax.plot(
+
+        plot_data[
+            "LIFE_PERCENT"
+        ],
+
+        plot_data[
+            "MAHALANOBIS_SCORE"
+        ],
+
+        linewidth=1.0,
+
+        alpha=0.25,
+
+        label="Raw Mahalanobis"
+
+    )
+
+
+    # ========================================================
+    # CLEAN ROLLING SCORE
+    # ========================================================
+
+    ax.plot(
+
+        plot_data[
+            "LIFE_PERCENT"
+        ],
+
+        plot_data[
+            "ROLLING_SCORE_CLEAN"
+        ],
+
+        linewidth=2.8,
+
+        label="Rolling Mahalanobis (5)"
+
+    )
+
+
+    # ========================================================
+    # HEALTHY P95
+    # ========================================================
+
+    ax.axhline(
+
+        healthy_p95,
+
+        linestyle=":",
+
+        linewidth=1.5,
+
+        alpha=0.7,
+
+        label=(
+
+            f"Healthy P95 = "
+            f"{healthy_p95:.2f}"
+
+        )
+
+    )
+
+
+    # ========================================================
+    # MULTIPLIED DEGRADATION THRESHOLD
+    # ========================================================
+
+    ax.axhline(
+
+        threshold,
+
+        linestyle="--",
+
+        linewidth=2.2,
+
+        label=(
+
+            f"Threshold = "
+            f"{THRESHOLD_MULTIPLIER:.2f}× P95 "
+            f"= {threshold:.2f}"
+
+        )
+
+    )
+
+
+    # ========================================================
+    # 100% REPLACEMENT MARKER
+    # ========================================================
+
+    ax.axvline(
+
+        100,
+
+        color="black",
+
+        linewidth=4,
+
+        linestyle="-",
+
+        label="Breather replacement"
+
+    )
+
+
+    # ========================================================
+    # SUSTAINED CROSSING MARKERS
+    # ========================================================
+
+    crossing_starts = plot_data[
+        plot_data[
+            "SUSTAINED_CROSSING_START"
+        ]
+    ]
+
+
+    if not crossing_starts.empty:
+
+        crossing_lives = (
+
+            crossing_starts[
+                "LIFE_PERCENT"
+            ]
+
+            .tolist()
+
+        )
+
+
+        # ----------------------------------------------------
+        # First sustained period
+        # ----------------------------------------------------
+
+        first_crossing_start = (
+            crossing_lives[0]
+        )
+
+
+        first_detection_row = (
+
+            plot_data[
+                plot_data[
+                    "SUSTAINED_DEGRADATION"
+                ]
+            ]
+
+            .iloc[0]
+
+        )
+
+
+        first_detection = (
+
+            first_detection_row[
+                "LIFE_PERCENT"
+            ]
+
+        )
+
+
+        # ----------------------------------------------------
+        # Shade first persistence window
+        # ----------------------------------------------------
+
+        ax.axvspan(
+
+            first_crossing_start,
+
+            first_detection,
+
+            alpha=0.15,
+
+            label="First 5-point persistence"
+
+        )
+
+
+        # ----------------------------------------------------
+        # First confirmed detection
+        # ----------------------------------------------------
+
+        ax.axvline(
+
+            first_detection,
+
+            linestyle=":",
+
+            linewidth=2.8,
+
+            label=(
+
+                f"First sustained detection "
+                f"≈ {first_detection:.1f}%"
+
+            )
+
+        )
+
+
+        # ----------------------------------------------------
+        # Subsequent crossings
+        # ----------------------------------------------------
+
+        if len(crossing_lives) > 1:
+
+            for i, life in enumerate(
+                crossing_lives[1:]
+            ):
+
+                ax.axvline(
+
+                    life,
+
+                    linestyle=":",
+
+                    linewidth=1.8,
+
+                    alpha=0.75,
+
+                    label=(
+
+                        "Subsequent sustained "
+                        "crossing"
+                        if i == 0
+                        else None
+
+                    )
+
+                )
+
+
+    # ========================================================
+    # AXES
+    # ========================================================
+
+    ax.set_xlim(
+
+        PLOT_START_LIFE,
+
+        100
+
+    )
+
+
+    ax.set_xlabel(
+        "Engine life (%)"
+    )
+
+
+    ax.set_ylabel(
+        "Mahalanobis distance"
+    )
+
+
+    ax.set_title(
+
+        f"Breather Degradation Trajectory — "
+        f"ESN {int(esn)}",
+
+        fontweight="bold",
+
+        pad=15
+
+    )
+
+
+    ax.grid(
+        True,
+        alpha=0.20
+    )
+
+
+    # ========================================================
+    # INFORMATION BOX
+    # ========================================================
+
+    if pd.isna(
+        detection_life
+    ):
+
+        detection_text = (
+            "No sustained detection"
+        )
+
+    else:
+
+        detection_text = (
+
+            f"First sustained detection: "
+            f"{detection_life:.1f}% life"
+
+        )
+
+
+    info_text = (
+
+        f"Healthy P95: "
+        f"{healthy_p95:.2f}\n"
+
+        f"Multiplier: "
+        f"{THRESHOLD_MULTIPLIER:.2f}×\n"
+
+        f"Threshold: "
+        f"{threshold:.2f}\n"
+
+        f"{detection_text}\n"
+
+        f"Warning lead: "
+        f"{row['Warning_Lead_%']:.1f}%"
+
+        if not pd.isna(
+            row["Warning_Lead_%"]
+        )
+
+        else
+
+        f"Healthy P95: "
+        f"{healthy_p95:.2f}\n"
+
+        f"Multiplier: "
+        f"{THRESHOLD_MULTIPLIER:.2f}×\n"
+
+        f"Threshold: "
+        f"{threshold:.2f}\n"
+
+        f"{detection_text}\n"
+
+        f"Warning lead: N/A"
+
+    )
+
+
+    ax.text(
+
+        0.98,
+
+        0.97,
+
+        info_text,
+
+        transform=ax.transAxes,
+
+        ha="right",
+
+        va="top",
+
+        fontsize=10,
+
+        bbox=dict(
+
+            boxstyle="round,pad=0.4",
+
+            alpha=0.12
+
+        )
+
+    )
+
+
+    ax.legend(
+        loc="upper left"
+    )
+
+
+    plt.tight_layout()
+
+
+    # ========================================================
+    # SAVE
+    # ========================================================
+
+    output_path = os.path.join(
+
+        output_directory,
+
+        f"ESN_{int(esn)}_Mahalanobis_Demo.png"
+
+    )
+
+
+    plt.savefig(
+
+        output_path,
+
+        bbox_inches="tight"
+
+    )
+
+
+    plt.show()
+
+    plt.close()
+
+
+    return output_path
+
+
+# ============================================================
+# 37. GENERATE INDIVIDUAL DEMO PLOTS
+# ============================================================
+
+print("\n")
+print("=" * 70)
+print("GENERATING ESN PLOTS")
+print("=" * 70)
+
+
+demo_plot_paths = []
+
+
+for esn in demo_esns:
+
+    path = create_esn_plot(
+
+        esn,
+
+        anomaly_results,
+
+        summary_df,
+
+        PLOT_DIR
+
+    )
+
+
+    if path:
+
+        demo_plot_paths.append(
+            path
+        )
+
+
+# ============================================================
+# 38. FLEET-LEVEL PLOT
+# ============================================================
+
+print("\nCreating fleet-level plot...")
+
+
+fig, ax = plt.subplots(
+
+    figsize=(14, 7)
+
+)
+
+
+# ------------------------------------------------------------
+# All ESNs
+# ------------------------------------------------------------
+
+for esn, group in (
+
+    anomaly_results
+    .groupby("ESN")
+
+):
+
+
+    group = (
+
+        group
+
+        .sort_values(
+            "LIFE_PERCENT"
+        )
+
+    )
+
+
+    group = group[
+        group[
+            "LIFE_PERCENT"
+        ]
+        >= PLOT_START_LIFE
+    ]
+
+
+    if group.empty:
+
+        continue
+
+
+    ax.plot(
+
+        group[
+            "LIFE_PERCENT"
+        ],
+
+        group[
+            "ROLLING_SCORE_CLEAN"
+        ],
+
+        alpha=0.10,
+
+        linewidth=0.8
+
+    )
+
+
+# ------------------------------------------------------------
+# Highlight selected ESNs
+# ------------------------------------------------------------
+
+for esn in demo_esns:
+
+
+    group = (
+
+        anomaly_results[
+            anomaly_results[
+                "ESN"
+            ] == esn
+        ]
+
+        .sort_values(
+            "LIFE_PERCENT"
+        )
+
+    )
+
+
+    group = group[
+        group[
+            "LIFE_PERCENT"
+        ]
+        >= PLOT_START_LIFE
+    ]
+
+
+    if group.empty:
+
+        continue
+
+
+    ax.plot(
+
+        group[
+            "LIFE_PERCENT"
+        ],
+
+        group[
+            "ROLLING_SCORE_CLEAN"
+        ],
+
+        linewidth=2.5,
+
+        label=f"ESN {int(esn)}"
+
+    )
+
+
+# ------------------------------------------------------------
+# Healthy baseline
+# ------------------------------------------------------------
+
+ax.axvspan(
+
+    BASELINE_START,
+
+    BASELINE_END,
+
+    alpha=0.10,
+
+    label="Healthy baseline"
+
+)
+
+
+# ------------------------------------------------------------
+# Replacement marker
+# ------------------------------------------------------------
+
+ax.axvline(
+
+    100,
+
+    color="black",
+
+    linewidth=4,
+
+    linestyle="-",
+
+    label="Breather replacement"
+
+)
+
+
+# ------------------------------------------------------------
+# Formatting
+# ------------------------------------------------------------
+
+ax.set_xlim(
+
+    PLOT_START_LIFE,
+
+    100
+
+)
+
+
+ax.set_xlabel(
+    "Engine life (%)"
+)
+
+
+ax.set_ylabel(
+    "Rolling Mahalanobis distance"
+)
+
+
+ax.set_title(
+
+    "Fleet-Level Breather Degradation Trajectories",
+
+    fontweight="bold",
+
+    fontsize=16
+
+)
+
+
+ax.grid(
+
+    True,
+
+    alpha=0.20
+
+)
+
+
+ax.legend(
+    loc="upper left"
+)
+
+
+plt.tight_layout()
+
+
+fleet_plot_path = os.path.join(
+
+    PLOT_DIR,
+
+    "Fleet_Degradation_Trajectories.png"
+
+)
+
+
+plt.savefig(
+
+    fleet_plot_path,
+
+    bbox_inches="tight"
+
+)
+
+
+plt.show()
+
+plt.close()
+
+
+# ============================================================
+# 39. DETECTION-LIFE DISTRIBUTION
+# ============================================================
+
+detection_values = (
+
+    summary_df[
+        "First_Sustained_Detection_Life_%"
+    ]
+
+    .dropna()
+
+)
+
+
+fig, ax = plt.subplots(
+
+    figsize=(11, 6)
+
+)
+
+
+if len(detection_values) > 0:
+
+
+    ax.hist(
+
+        detection_values,
+
+        bins=15,
+
+        alpha=0.80,
+
+        edgecolor="black"
+
+    )
+
+
+    median_detection = (
+        detection_values
+        .median()
+    )
+
+
+    ax.axvline(
+
+        median_detection,
+
+        linestyle="--",
+
+        linewidth=2,
+
+        label=(
+
+            f"Median first sustained "
+            f"detection = "
+            f"{median_detection:.1f}%"
+
+        )
+
+    )
+
+
+    ax.set_title(
+
+        "Distribution of First Sustained Degradation Detection",
+
+        fontweight="bold"
+
+    )
+
+
+    ax.set_xlabel(
+
+        "Life at first sustained threshold crossing (%)"
+
+    )
+
+
+    ax.set_ylabel(
+
+        "Number of ESNs"
+
+    )
+
+
+    ax.legend()
+
+
+else:
+
+
+    ax.text(
+
+        0.5,
+
+        0.5,
+
+        "No sustained threshold crossings detected",
+
+        ha="center",
+
+        va="center",
+
+        transform=ax.transAxes
+
+    )
+
+
+ax.grid(
+
+    True,
+
+    alpha=0.20
+
+)
+
+
+plt.tight_layout()
+
+
+distribution_path = os.path.join(
+
+    PLOT_DIR,
+
+    "Detection_Life_Distribution.png"
+
+)
+
+
+plt.savefig(
+
+    distribution_path,
+
+    bbox_inches="tight"
+
+)
+
+
+plt.show()
+
+plt.close()
+
+
+# ============================================================
+# 40. FINAL PPT SUMMARY
+# ============================================================
+
+ppt_summary = (
+
+    summary_df
+
+    .sort_values(
+
+        [
+
+            "Sustained_Detection",
+
+            "First_Sustained_Detection_Life_%"
+
+        ],
+
+        ascending=[
+
+            False,
+
+            True
+
+        ]
+
+    )
+
+)
+
+
+print("\n")
+print("=" * 70)
+print("PPT SUMMARY")
+print("=" * 70)
+
+
+display(
+
+    ppt_summary[
+
+        [
+
+            "ESN",
+
+            "Observations",
+
+            "Healthy_Mean",
+
+            "Healthy_P95",
+
+            "Threshold_Multiplier",
+
+            "Degradation_Threshold",
+
+            "First_Crossing_Start_Life_%",
+
+            "First_Sustained_Detection_Life_%",
+
+            "Warning_Lead_%",
+
+            "Subsequent_Crossings",
+
+            "Number_Sustained_Periods",
+
+            "Late_Life_Mean",
+
+            "Late_to_Healthy_Ratio",
+
+            "Sustained_Detection"
+
+        ]
+
+    ]
+
+)
+
+
+# ============================================================
+# 41. OUTPUT FILE LOCATIONS
+# ============================================================
+
+print("\n")
+print("=" * 70)
+print("OUTPUT FILES")
+print("=" * 70)
+
+
+print(
+    "\nPlots:"
+)
+
+
+for filename in sorted(
+    os.listdir(PLOT_DIR)
+):
+
+    print(
+        os.path.join(
+            PLOT_DIR,
+            filename
+        )
+    )
+
+
+print(
+    "\nTables:"
+)
+
+
+for filename in sorted(
+    os.listdir(TABLE_DIR)
+):
+
+    print(
+        os.path.join(
+            TABLE_DIR,
+            filename
+        )
+    )
+
+
+# ============================================================
+# 42. FINAL METHOD SUMMARY
+# ============================================================
+
+print("\n")
+print("=" * 70)
+print("METHOD SUMMARY")
+print("=" * 70)
+
+print(
+    "1. Single replacement ESNs only"
+)
+
+print(
+    "2. Before / after replacement split"
+)
+
+print(
+    "3. max(Run_Number) == 1 filter"
+)
+
+print(
+    "4. Mahalanobis calculated on BEFORE data only"
+)
+
+print(
+    "5. EMA span = 5"
+)
+
+print(
+    "6. ESN-specific healthy baseline = 20-60%"
+)
+
+print(
+    "7. Rolling Mahalanobis window = 5"
+)
+
+print(
+    "8. Isolated spike filtering"
+)
+
+print(
+    "9. Healthy P95 calculated from 20-60%"
+)
+
+print(
+    f"10. Degradation threshold = "
+    f"Healthy P95 × {THRESHOLD_MULTIPLIER}"
+)
+
+print(
+    f"11. Persistence = "
+    f"{SUSTAINED_POINTS} consecutive points"
+)
+
+print(
+    "12. First sustained crossing recorded"
+)
+
+print(
+    "13. Subsequent sustained crossings recorded"
+)
+
+print(
+    "14. Warning lead calculated relative to 100% replacement"
+)
+
+print(
+    "15. 100% life shown as thick black replacement line"
+)
+
+print(
+    "16. Demo ESNs selected from sustained trajectory behaviour"
+)
+
+print("\n")
+print("ANALYSIS COMPLETE.")
