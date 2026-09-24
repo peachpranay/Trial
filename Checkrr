@@ -1,0 +1,638 @@
+# ============================================================
+# MULTIPLIER SENSITIVITY ANALYSIS
+# ============================================================
+# Uses the existing:
+#   anomaly_results
+#   BASELINE_START
+#   BASELINE_END
+#   PLOT_START_LIFE
+#   PERCENTILE
+#   SUSTAINED_POINTS
+#
+# Does NOT recalculate Mahalanobis distance.
+# ============================================================
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import os
+
+
+# ------------------------------------------------------------
+# SETTINGS
+# ------------------------------------------------------------
+
+TEST_MULTIPLIERS = [1.0, 1.2, 1.5, 2.0, 2.5, 3.0, 4.0]
+
+# Use the already-created cleaned rolling score
+SCORE_COLUMN = "ROLLING_SCORE_CLEAN"
+
+
+# ------------------------------------------------------------
+# CHECK INPUT
+# ------------------------------------------------------------
+
+required_columns = [
+    "ESN",
+    "LIFE_PERCENT",
+    SCORE_COLUMN
+]
+
+missing_columns = [
+    c for c in required_columns
+    if c not in anomaly_results.columns
+]
+
+if missing_columns:
+    raise ValueError(
+        f"Missing columns in anomaly_results: {missing_columns}"
+    )
+
+
+df = anomaly_results.copy()
+
+df["LIFE_PERCENT"] = pd.to_numeric(
+    df["LIFE_PERCENT"],
+    errors="coerce"
+)
+
+df[SCORE_COLUMN] = pd.to_numeric(
+    df[SCORE_COLUMN],
+    errors="coerce"
+)
+
+
+# ------------------------------------------------------------
+# STORAGE
+# ------------------------------------------------------------
+
+all_results = []
+summary_results = []
+
+
+# ============================================================
+# LOOP THROUGH EACH MULTIPLIER
+# ============================================================
+
+for multiplier in TEST_MULTIPLIERS:
+
+    print("\n" + "=" * 70)
+    print(f"TESTING MULTIPLIER = {multiplier:.1f}x")
+    print("=" * 70)
+
+    multiplier_results = []
+
+
+    # --------------------------------------------------------
+    # PROCESS EACH ESN INDEPENDENTLY
+    # --------------------------------------------------------
+
+    for esn, df_esn in df.groupby("ESN"):
+
+        df_esn = df_esn.sort_values(
+            "LIFE_PERCENT"
+        ).copy()
+
+        # ----------------------------------------------------
+        # HEALTHY BASELINE: 20–60% LIFE
+        # ----------------------------------------------------
+
+        healthy_data = df_esn.loc[
+            (df_esn["LIFE_PERCENT"] >= BASELINE_START) &
+            (df_esn["LIFE_PERCENT"] <= BASELINE_END),
+            SCORE_COLUMN
+        ].dropna()
+
+        # Need enough healthy observations
+        if len(healthy_data) < 5:
+            continue
+
+        healthy_p95 = np.percentile(
+            healthy_data,
+            PERCENTILE
+        )
+
+        # ----------------------------------------------------
+        # ESN-SPECIFIC THRESHOLD
+        # ----------------------------------------------------
+
+        threshold = healthy_p95 * multiplier
+
+
+        # ----------------------------------------------------
+        # ONLY LOOK AT THE DETECTION REGION
+        # ----------------------------------------------------
+
+        detection_df = df_esn.loc[
+            df_esn["LIFE_PERCENT"] >= PLOT_START_LIFE
+        ].copy()
+
+        detection_df = detection_df.reset_index(
+            drop=True
+        )
+
+
+        # ----------------------------------------------------
+        # ABOVE THRESHOLD
+        # ----------------------------------------------------
+
+        detection_df["ABOVE_THRESHOLD"] = (
+            detection_df[SCORE_COLUMN] > threshold
+        )
+
+        detection_df["ABOVE_THRESHOLD"] = (
+            detection_df["ABOVE_THRESHOLD"]
+            .fillna(False)
+        )
+
+
+        # ----------------------------------------------------
+        # 5-CONSECUTIVE-POINT PERSISTENCE
+        # ----------------------------------------------------
+
+        detection_df["PERSISTENCE_COUNT"] = 0
+
+        persistence_count = 0
+
+        for i in range(len(detection_df)):
+
+            if detection_df.loc[i, "ABOVE_THRESHOLD"]:
+
+                persistence_count += 1
+
+            else:
+
+                persistence_count = 0
+
+            detection_df.loc[
+                i,
+                "PERSISTENCE_COUNT"
+            ] = persistence_count
+
+
+        # ----------------------------------------------------
+        # SUSTAINED DETECTION
+        # ----------------------------------------------------
+
+        detection_df["SUSTAINED_DEGRADATION"] = (
+            detection_df["PERSISTENCE_COUNT"]
+            >= SUSTAINED_POINTS
+        )
+
+
+        # ----------------------------------------------------
+        # FIRST CONFIRMED DETECTION
+        # ----------------------------------------------------
+
+        sustained_rows = detection_df.loc[
+            detection_df["SUSTAINED_DEGRADATION"]
+        ]
+
+
+        if len(sustained_rows) > 0:
+
+            # First confirmed detection = 5th
+            # consecutive point
+            first_detection = sustained_rows.iloc[0]
+
+            first_detection_life = (
+                first_detection["LIFE_PERCENT"]
+            )
+
+            warning_lead = (
+                100.0 - first_detection_life
+            )
+
+            detected_before_replacement = (
+                first_detection_life < 100
+            )
+
+        else:
+
+            first_detection_life = np.nan
+            warning_lead = np.nan
+            detected_before_replacement = False
+
+
+        # ----------------------------------------------------
+        # FIRST SUSTAINED RUN START
+        # ----------------------------------------------------
+        # If the 5th point confirms the detection,
+        # the beginning of that persistent run is:
+        #
+        # detection position - SUSTAINED_POINTS + 1
+        #
+        # This is useful for plotting.
+
+        first_run_start_life = np.nan
+
+        if len(sustained_rows) > 0:
+
+            first_detection_position = (
+                sustained_rows.index[0]
+            )
+
+            first_run_start_position = (
+                first_detection_position
+                - SUSTAINED_POINTS
+                + 1
+            )
+
+            if first_run_start_position >= 0:
+
+                first_run_start_life = (
+                    detection_df.loc[
+                        first_run_start_position,
+                        "LIFE_PERCENT"
+                    ]
+                )
+
+
+        # ----------------------------------------------------
+        # COUNT ALL SUSTAINED DETECTION POINTS
+        # ----------------------------------------------------
+
+        number_sustained_points = int(
+            detection_df[
+                "SUSTAINED_DEGRADATION"
+            ].sum()
+        )
+
+
+        # ----------------------------------------------------
+        # STORE ESN RESULT
+        # ----------------------------------------------------
+
+        result = {
+
+            "Multiplier": multiplier,
+
+            "ESN": esn,
+
+            "Healthy_P95": healthy_p95,
+
+            "Threshold": threshold,
+
+            "First_Run_Start_Life_%":
+                first_run_start_life,
+
+            "First_Confirmed_Detection_Life_%":
+                first_detection_life,
+
+            "Warning_Lead_%":
+                warning_lead,
+
+            "Detected_Before_Replacement":
+                detected_before_replacement,
+
+            "Number_Sustained_Points":
+                number_sustained_points,
+
+            "Healthy_Observations":
+                len(healthy_data)
+
+        }
+
+        multiplier_results.append(result)
+        all_results.append(result)
+
+
+    # ========================================================
+    # SUMMARY FOR THIS MULTIPLIER
+    # ========================================================
+
+    result_df = pd.DataFrame(
+        multiplier_results
+    )
+
+
+    if len(result_df) == 0:
+        continue
+
+
+    total_esns = len(result_df)
+
+    detected_mask = (
+        result_df[
+            "First_Confirmed_Detection_Life_%"
+        ].notna()
+    )
+
+    detected_esns = int(
+        detected_mask.sum()
+    )
+
+    no_detection_esns = (
+        total_esns - detected_esns
+    )
+
+
+    # Only detections before replacement
+    before_replacement = result_df.loc[
+        result_df["Detected_Before_Replacement"]
+    ].copy()
+
+
+    if len(before_replacement) > 0:
+
+        median_detection_life = (
+            before_replacement[
+                "First_Confirmed_Detection_Life_%"
+            ].median()
+        )
+
+        mean_detection_life = (
+            before_replacement[
+                "First_Confirmed_Detection_Life_%"
+            ].mean()
+        )
+
+        median_warning_lead = (
+            before_replacement[
+                "Warning_Lead_%"
+            ].median()
+        )
+
+        mean_warning_lead = (
+            before_replacement[
+                "Warning_Lead_%"
+            ].mean()
+        )
+
+        max_warning_lead = (
+            before_replacement[
+                "Warning_Lead_%"
+            ].max()
+        )
+
+    else:
+
+        median_detection_life = np.nan
+        mean_detection_life = np.nan
+        median_warning_lead = np.nan
+        mean_warning_lead = np.nan
+        max_warning_lead = np.nan
+
+
+    detection_rate = (
+        detected_esns / total_esns * 100
+    )
+
+
+    summary = {
+
+        "Multiplier": multiplier,
+
+        "Total_ESNs": total_esns,
+
+        "Detected_ESNs": detected_esns,
+
+        "No_Detection_ESNs":
+            no_detection_esns,
+
+        "Detection_Rate_%":
+            detection_rate,
+
+        "Median_Detection_Life_%":
+            median_detection_life,
+
+        "Mean_Detection_Life_%":
+            mean_detection_life,
+
+        "Median_Warning_Lead_%":
+            median_warning_lead,
+
+        "Mean_Warning_Lead_%":
+            mean_warning_lead,
+
+        "Maximum_Warning_Lead_%":
+            max_warning_lead
+
+    }
+
+    summary_results.append(summary)
+
+
+# ============================================================
+# CREATE DATAFRAMES
+# ============================================================
+
+multiplier_results_df = pd.DataFrame(
+    all_results
+)
+
+multiplier_summary_df = pd.DataFrame(
+    summary_results
+)
+
+
+# ============================================================
+# DISPLAY SUMMARY
+# ============================================================
+
+print("\n")
+print("=" * 90)
+print("MULTIPLIER SENSITIVITY SUMMARY")
+print("=" * 90)
+
+display(
+    multiplier_summary_df
+    .round(2)
+)
+
+
+# ============================================================
+# DISPLAY ESN-LEVEL RESULTS
+# ============================================================
+
+print("\n")
+print("=" * 90)
+print("ESN-LEVEL RESULTS")
+print("=" * 90)
+
+display(
+    multiplier_results_df
+    .round(3)
+)
+
+
+# ============================================================
+# PLOT 1:
+# DETECTION RATE VS MULTIPLIER
+# ============================================================
+
+plt.figure(figsize=(10, 6))
+
+plt.plot(
+    multiplier_summary_df["Multiplier"],
+    multiplier_summary_df["Detection_Rate_%"],
+    marker="o",
+    linewidth=2
+)
+
+plt.xlabel("Threshold Multiplier")
+plt.ylabel("ESNs Detected Before Replacement (%)")
+plt.title(
+    "Detection Rate vs Threshold Multiplier"
+)
+
+plt.xticks(TEST_MULTIPLIERS)
+plt.grid(True, alpha=0.3)
+
+plt.tight_layout()
+
+plt.show()
+
+
+# ============================================================
+# PLOT 2:
+# MEDIAN WARNING LEAD VS MULTIPLIER
+# ============================================================
+
+plt.figure(figsize=(10, 6))
+
+plt.plot(
+    multiplier_summary_df["Multiplier"],
+    multiplier_summary_df["Median_Warning_Lead_%"],
+    marker="o",
+    linewidth=2
+)
+
+plt.xlabel("Threshold Multiplier")
+plt.ylabel("Median Warning Lead (%)")
+plt.title(
+    "Median Warning Lead vs Threshold Multiplier"
+)
+
+plt.xticks(TEST_MULTIPLIERS)
+plt.grid(True, alpha=0.3)
+
+plt.tight_layout()
+
+plt.show()
+
+
+# ============================================================
+# PLOT 3:
+# MEDIAN DETECTION LIFE VS MULTIPLIER
+# ============================================================
+
+plt.figure(figsize=(10, 6))
+
+plt.plot(
+    multiplier_summary_df["Multiplier"],
+    multiplier_summary_df["Median_Detection_Life_%"],
+    marker="o",
+    linewidth=2
+)
+
+plt.xlabel("Threshold Multiplier")
+plt.ylabel("Median Detection Life (%)")
+plt.title(
+    "Median Detection Life vs Threshold Multiplier"
+)
+
+plt.xticks(TEST_MULTIPLIERS)
+plt.grid(True, alpha=0.3)
+
+plt.tight_layout()
+
+plt.show()
+
+
+# ============================================================
+# PLOT 4:
+# DETECTION RATE + WARNING LEAD
+# ============================================================
+
+fig, ax1 = plt.subplots(
+    figsize=(10, 6)
+)
+
+ax1.plot(
+    multiplier_summary_df["Multiplier"],
+    multiplier_summary_df["Detection_Rate_%"],
+    marker="o",
+    linewidth=2,
+    label="Detection Rate"
+)
+
+ax1.set_xlabel(
+    "Threshold Multiplier"
+)
+
+ax1.set_ylabel(
+    "Detection Rate (%)"
+)
+
+ax1.set_xticks(
+    TEST_MULTIPLIERS
+)
+
+ax2 = ax1.twinx()
+
+ax2.plot(
+    multiplier_summary_df["Multiplier"],
+    multiplier_summary_df["Median_Warning_Lead_%"],
+    marker="s",
+    linewidth=2,
+    label="Median Warning Lead"
+)
+
+ax2.set_ylabel(
+    "Median Warning Lead (%)"
+)
+
+plt.title(
+    "Detection Rate and Warning Lead vs Threshold Multiplier"
+)
+
+ax1.grid(True, alpha=0.3)
+
+plt.tight_layout()
+
+plt.show()
+
+
+# ============================================================
+# SAVE RESULTS
+# ============================================================
+
+os.makedirs(
+    TABLE_DIR,
+    exist_ok=True
+)
+
+multiplier_summary_path = os.path.join(
+    TABLE_DIR,
+    "Multiplier_Sensitivity_Summary.csv"
+)
+
+multiplier_esn_path = os.path.join(
+    TABLE_DIR,
+    "Multiplier_Sensitivity_ESN_Level.csv"
+)
+
+multiplier_summary_df.to_csv(
+    multiplier_summary_path,
+    index=False
+)
+
+multiplier_results_df.to_csv(
+    multiplier_esn_path,
+    index=False
+)
+
+
+print("\n")
+print("=" * 90)
+print("FILES SAVED")
+print("=" * 90)
+
+print(
+    f"Summary: {multiplier_summary_path}"
+)
+
+print(
+    f"ESN-level: {multiplier_esn_path}"
+)
