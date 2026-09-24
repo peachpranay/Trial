@@ -1,0 +1,828 @@
+# ============================================================
+# RELATIONSHIP BETWEEN:
+#
+# 1. HEALTHY 95TH PERCENTILE (20-60% LIFE)
+# 2. FULL-LIFE 95TH PERCENTILE (20-100% LIFE)
+#
+# MULTIPLIER:
+#
+# Full-life P95 / Healthy P95
+#
+# This block uses ONLY variables already created in the
+# previous analysis:
+#
+#     anomaly_results
+#     BASELINE_START
+#     BASELINE_END
+#     PLOT_START_LIFE
+#     PERCENTILE
+#
+# No data is reloaded.
+# ============================================================
+
+
+# ============================================================
+# 1. CALCULATE P95 FOR EACH ESN
+# ============================================================
+
+p95_relationship_results = []
+
+
+for esn, df_esn in anomaly_results.groupby("ESN"):
+
+    df_esn = (
+        df_esn
+        .sort_values("LIFE_PERCENT")
+        .copy()
+    )
+
+
+    # --------------------------------------------------------
+    # HEALTHY REGION: 20-60%
+    # --------------------------------------------------------
+
+    healthy_data = (
+
+        df_esn.loc[
+            (
+                df_esn["LIFE_PERCENT"] >= BASELINE_START
+            )
+            &
+            (
+                df_esn["LIFE_PERCENT"] <= BASELINE_END
+            ),
+            "ROLLING_SCORE_CLEAN"
+        ]
+
+        .dropna()
+
+    )
+
+
+    # --------------------------------------------------------
+    # FULL ANALYSIS REGION: 20-100%
+    # --------------------------------------------------------
+
+    full_life_data = (
+
+        df_esn.loc[
+            df_esn["LIFE_PERCENT"] >= PLOT_START_LIFE,
+            "ROLLING_SCORE_CLEAN"
+        ]
+
+        .dropna()
+
+    )
+
+
+    # --------------------------------------------------------
+    # Require enough observations
+    # --------------------------------------------------------
+
+    if len(healthy_data) < 10:
+
+        continue
+
+
+    if len(full_life_data) < 10:
+
+        continue
+
+
+    # --------------------------------------------------------
+    # Calculate P95
+    # --------------------------------------------------------
+
+    healthy_p95 = np.percentile(
+        healthy_data,
+        PERCENTILE
+    )
+
+
+    full_life_p95 = np.percentile(
+        full_life_data,
+        PERCENTILE
+    )
+
+
+    # --------------------------------------------------------
+    # Calculate multiplier
+    #
+    # Full-life P95
+    # ----------------
+    # Healthy P95
+    # --------------------------------------------------------
+
+    if healthy_p95 > 0:
+
+        p95_multiplier = (
+
+            full_life_p95
+
+            /
+
+            healthy_p95
+
+        )
+
+    else:
+
+        p95_multiplier = np.nan
+
+
+    # --------------------------------------------------------
+    # Store result
+    # --------------------------------------------------------
+
+    p95_relationship_results.append({
+
+        "ESN": int(esn),
+
+        "Healthy_P95_20_60":
+            healthy_p95,
+
+        "Full_Life_P95_20_100":
+            full_life_p95,
+
+        "P95_Multiplier":
+            p95_multiplier,
+
+        "Healthy_Observations":
+            len(healthy_data),
+
+        "Full_Life_Observations":
+            len(full_life_data)
+
+    })
+
+
+# ============================================================
+# 2. CREATE DATAFRAME
+# ============================================================
+
+p95_relationship_df = pd.DataFrame(
+    p95_relationship_results
+)
+
+
+if p95_relationship_df.empty:
+
+    raise ValueError(
+        "No ESNs had enough valid observations "
+        "to calculate the P95 relationship."
+    )
+
+
+# ============================================================
+# 3. REMOVE INVALID RATIOS
+# ============================================================
+
+p95_relationship_df = (
+
+    p95_relationship_df[
+        p95_relationship_df[
+            "P95_Multiplier"
+        ].notna()
+    ]
+
+    .copy()
+
+)
+
+
+# ============================================================
+# 4. DISPLAY ESN-LEVEL RESULTS
+# ============================================================
+
+print("\n")
+print("=" * 80)
+print("P95 RELATIONSHIP — ESN LEVEL")
+print("=" * 80)
+
+
+display(
+
+    p95_relationship_df.sort_values(
+        "P95_Multiplier"
+    )
+
+)
+
+
+# ============================================================
+# 5. MULTIPLIER STATISTICS
+# ============================================================
+
+ratios = (
+
+    p95_relationship_df[
+        "P95_Multiplier"
+    ]
+
+    .dropna()
+
+)
+
+
+print("\n")
+print("=" * 80)
+print("P95 MULTIPLIER STATISTICS")
+print("=" * 80)
+
+
+print(
+    f"Number of ESNs : "
+    f"{len(ratios):,}"
+)
+
+
+print(
+    f"Minimum        : "
+    f"{ratios.min():.3f}x"
+)
+
+
+print(
+    f"25th percentile : "
+    f"{ratios.quantile(0.25):.3f}x"
+)
+
+
+print(
+    f"Median          : "
+    f"{ratios.median():.3f}x"
+)
+
+
+print(
+    f"Mean            : "
+    f"{ratios.mean():.3f}x"
+)
+
+
+print(
+    f"75th percentile : "
+    f"{ratios.quantile(0.75):.3f}x"
+)
+
+
+print(
+    f"90th percentile : "
+    f"{ratios.quantile(0.90):.3f}x"
+)
+
+
+print(
+    f"95th percentile : "
+    f"{ratios.quantile(0.95):.3f}x"
+)
+
+
+print(
+    f"Maximum         : "
+    f"{ratios.max():.3f}x"
+)
+
+
+# ============================================================
+# 6. SUGGESTED MULTIPLIERS
+# ============================================================
+#
+# These are NOT automatically selected as the final
+# threshold.
+#
+# They simply show the empirical distribution so you can
+# decide which multiplier to test.
+# ============================================================
+
+suggested_multipliers = pd.DataFrame({
+
+    "Statistic": [
+
+        "Minimum",
+
+        "25th percentile",
+
+        "Median",
+
+        "Mean",
+
+        "75th percentile",
+
+        "90th percentile",
+
+        "95th percentile",
+
+        "Maximum"
+
+    ],
+
+    "Multiplier": [
+
+        ratios.min(),
+
+        ratios.quantile(0.25),
+
+        ratios.median(),
+
+        ratios.mean(),
+
+        ratios.quantile(0.75),
+
+        ratios.quantile(0.90),
+
+        ratios.quantile(0.95),
+
+        ratios.max()
+
+    ]
+
+})
+
+
+print("\n")
+print("=" * 80)
+print("EMPIRICAL MULTIPLIER RANGE")
+print("=" * 80)
+
+
+display(
+    suggested_multipliers
+)
+
+
+# ============================================================
+# 7. CORRELATION BETWEEN THE TWO P95 VALUES
+# ============================================================
+
+correlation = (
+
+    p95_relationship_df[
+        "Healthy_P95_20_60"
+    ]
+
+    .corr(
+
+        p95_relationship_df[
+            "Full_Life_P95_20_100"
+        ]
+
+    )
+
+)
+
+
+print("\n")
+print("=" * 80)
+print("P95 RELATIONSHIP")
+print("=" * 80)
+
+
+print(
+    f"Pearson correlation : "
+    f"{correlation:.4f}"
+)
+
+
+# ============================================================
+# 8. LINEAR RELATIONSHIP
+# ============================================================
+#
+# Full-life P95 ≈ slope × Healthy P95 + intercept
+#
+# This helps determine whether a simple multiplier is
+# actually a reasonable approximation.
+# ============================================================
+
+x = (
+
+    p95_relationship_df[
+        "Healthy_P95_20_60"
+    ]
+
+    .values
+
+)
+
+
+y = (
+
+    p95_relationship_df[
+        "Full_Life_P95_20_100"
+    ]
+
+    .values
+
+)
+
+
+slope, intercept = np.polyfit(
+    x,
+    y,
+    1
+)
+
+
+predicted_y = (
+
+    slope * x
+
+    +
+
+    intercept
+
+)
+
+
+ss_res = np.sum(
+    (y - predicted_y) ** 2
+)
+
+
+ss_tot = np.sum(
+    (y - np.mean(y)) ** 2
+)
+
+
+if ss_tot > 0:
+
+    r_squared = (
+
+        1
+
+        -
+
+        ss_res / ss_tot
+
+    )
+
+else:
+
+    r_squared = np.nan
+
+
+print("\n")
+print("=" * 80)
+print("LINEAR RELATIONSHIP")
+print("=" * 80)
+
+
+print(
+    f"Full-life P95 ≈ "
+    f"{slope:.4f} × Healthy P95 "
+    f"+ {intercept:.4f}"
+)
+
+
+print(
+    f"R² : "
+    f"{r_squared:.4f}"
+)
+
+
+# ============================================================
+# 9. SCATTER PLOT
+# ============================================================
+
+fig, ax = plt.subplots(
+    figsize=(10, 7)
+)
+
+
+ax.scatter(
+
+    p95_relationship_df[
+        "Healthy_P95_20_60"
+    ],
+
+    p95_relationship_df[
+        "Full_Life_P95_20_100"
+    ],
+
+    alpha=0.70,
+
+    edgecolor="black",
+
+    linewidth=0.5
+
+)
+
+
+# ------------------------------------------------------------
+# Regression line
+# ------------------------------------------------------------
+
+x_line = np.linspace(
+
+    x.min(),
+
+    x.max(),
+
+    100
+
+)
+
+
+y_line = (
+
+    slope * x_line
+
+    +
+
+    intercept
+
+)
+
+
+ax.plot(
+
+    x_line,
+
+    y_line,
+
+    linestyle="--",
+
+    linewidth=2,
+
+    label=(
+
+        f"Linear fit: "
+        f"y = {slope:.2f}x + "
+        f"{intercept:.2f}\n"
+        f"R² = {r_squared:.2f}"
+
+    )
+
+)
+
+
+# ------------------------------------------------------------
+# 1:1 line
+#
+# This represents:
+#
+# Full-life P95 = Healthy P95
+# ------------------------------------------------------------
+
+min_value = min(
+    x.min(),
+    y.min()
+)
+
+
+max_value = max(
+    x.max(),
+    y.max()
+)
+
+
+ax.plot(
+
+    [min_value, max_value],
+
+    [min_value, max_value],
+
+    linestyle=":",
+
+    linewidth=1.5,
+
+    label="1:1 relationship"
+
+)
+
+
+ax.set_xlabel(
+    "Healthy P95 Mahalanobis (20–60%)"
+)
+
+
+ax.set_ylabel(
+    "Full-life P95 Mahalanobis (20–100%)"
+)
+
+
+ax.set_title(
+
+    "Relationship Between Healthy and Full-Life P95",
+
+    fontweight="bold"
+
+)
+
+
+ax.grid(
+    True,
+    alpha=0.20
+)
+
+
+ax.legend()
+
+
+plt.tight_layout()
+
+
+plt.show()
+
+
+# ============================================================
+# 10. MULTIPLIER DISTRIBUTION
+# ============================================================
+
+fig, ax = plt.subplots(
+    figsize=(11, 6)
+)
+
+
+ax.hist(
+
+    ratios,
+
+    bins=15,
+
+    alpha=0.80,
+
+    edgecolor="black"
+
+)
+
+
+# Median
+
+median_ratio = ratios.median()
+
+
+ax.axvline(
+
+    median_ratio,
+
+    linestyle="--",
+
+    linewidth=2,
+
+    label=(
+
+        f"Median = "
+        f"{median_ratio:.2f}x"
+
+    )
+
+)
+
+
+# 90th percentile
+
+p90_ratio = ratios.quantile(
+    0.90
+)
+
+
+ax.axvline(
+
+    p90_ratio,
+
+    linestyle=":",
+
+    linewidth=2,
+
+    label=(
+
+        f"90th percentile = "
+        f"{p90_ratio:.2f}x"
+
+    )
+
+)
+
+
+# 95th percentile
+
+p95_ratio = ratios.quantile(
+    0.95
+)
+
+
+ax.axvline(
+
+    p95_ratio,
+
+    linestyle="-.",
+
+    linewidth=2,
+
+    label=(
+
+        f"95th percentile = "
+        f"{p95_ratio:.2f}x"
+
+    )
+
+)
+
+
+ax.set_xlabel(
+    "Full-life P95 / Healthy P95"
+)
+
+
+ax.set_ylabel(
+    "Number of ESNs"
+)
+
+
+ax.set_title(
+
+    "Distribution of P95 Multipliers Across ESNs",
+
+    fontweight="bold"
+
+)
+
+
+ax.grid(
+    True,
+    alpha=0.20
+)
+
+
+ax.legend()
+
+
+plt.tight_layout()
+
+
+plt.show()
+
+
+# ============================================================
+# 11. SAVE RESULTS
+# ============================================================
+
+p95_relationship_path = os.path.join(
+
+    TABLE_DIR,
+
+    "P95_Healthy_vs_FullLife_Relationship.csv"
+
+)
+
+
+p95_relationship_df.to_csv(
+
+    p95_relationship_path,
+
+    index=False
+
+)
+
+
+print("\n")
+print("=" * 80)
+print("RESULT SAVED")
+print("=" * 80)
+
+
+print(
+    p95_relationship_path
+)
+
+
+# ============================================================
+# 12. FINAL INTERPRETATION OUTPUT
+# ============================================================
+
+print("\n")
+print("=" * 80)
+print("INTERPRETATION")
+print("=" * 80)
+
+
+print(
+    f"""
+Healthy P95:
+    Calculated from {BASELINE_START}-{BASELINE_END}% life.
+
+Full-life P95:
+    Calculated from {PLOT_START_LIFE}-100% life.
+
+Empirical multiplier:
+    Full-life P95 / Healthy P95
+
+Median multiplier:
+    {median_ratio:.3f}x
+
+90th percentile multiplier:
+    {p90_ratio:.3f}x
+
+95th percentile multiplier:
+    {p95_ratio:.3f}x
+
+Linear relationship:
+    Full-life P95 ≈
+    {slope:.3f} × Healthy P95
+    + {intercept:.3f}
+
+R²:
+    {r_squared:.3f}
+"""
+)
