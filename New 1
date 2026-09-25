@@ -1,0 +1,785 @@
+# ============================================================
+# BREATHER STEP-FUNCTION / PERCENTILE BIN ANALYSIS
+# ============================================================
+#
+# Pipeline:
+#
+# Raw parameters
+#       ↓
+# Mahalanobis score
+#       ↓
+# EMA Mahalanobis score
+#       ↓
+# Healthy region (20–60% normalized life)
+#       ↓
+# Healthy percentile thresholds
+#       ↓
+# Step-function degradation bins
+#       ↓
+# Plot against replacement
+#
+# IMPORTANT:
+# We DO NOT bin the raw parameters before EMA.
+# We bin the EMA Mahalanobis score AFTER smoothing.
+# ============================================================
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+
+# ============================================================
+# 1. CONFIGURATION
+# ============================================================
+
+# ------------------------------------------------------------
+# Change ONLY these names if your dataframe/column names differ
+# ------------------------------------------------------------
+
+DATA = df
+
+ESN_COL = "ESN"
+
+# Normalized engine life column, expected 0–100
+LIFE_COL = "Normalized_Life"
+
+# Pre/post replacement indicator if you already have one.
+# If you don't have one, the code below can instead use the
+# replacement cycle column.
+REPLACEMENT_CYCLE_COL = "Replacement_Cycle"
+
+# EMA Mahalanobis score generated in your previous analysis
+EMA_COL = "EMA_Mahalanobis"
+
+# Original Mahalanobis score, only used as fallback/reference
+MAHAL_COL = "Mahalanobis_Distance"
+
+
+# Healthy region used to calculate the percentile thresholds
+HEALTHY_START = 20
+HEALTHY_END   = 60
+
+
+# ------------------------------------------------------------
+# Percentile bins
+#
+# Example:
+#
+# 0–50       = Bin 1
+# 50–70      = Bin 2
+# 70–80      = Bin 3
+# 80–90      = Bin 4
+# 90–95      = Bin 5
+# 95–100     = Bin 6
+#
+# You can change these later.
+# ------------------------------------------------------------
+
+PERCENTILES = [0, 50, 70, 80, 90, 95, 100]
+
+
+# ============================================================
+# 2. BASIC CHECKS
+# ============================================================
+
+required_cols = [
+    ESN_COL,
+    LIFE_COL,
+    EMA_COL
+]
+
+missing_cols = [c for c in required_cols if c not in DATA.columns]
+
+if missing_cols:
+    raise ValueError(
+        f"Missing columns: {missing_cols}\n\n"
+        f"Available columns are:\n{list(DATA.columns)}"
+    )
+
+
+# Work on a copy
+work = DATA.copy()
+
+
+# ============================================================
+# 3. CLEAN DATA
+# ============================================================
+
+work[LIFE_COL] = pd.to_numeric(
+    work[LIFE_COL],
+    errors="coerce"
+)
+
+work[EMA_COL] = pd.to_numeric(
+    work[EMA_COL],
+    errors="coerce"
+)
+
+work = work.dropna(
+    subset=[
+        ESN_COL,
+        LIFE_COL,
+        EMA_COL
+    ]
+).copy()
+
+
+# ============================================================
+# 4. KEEP ONLY ESNs WITH EXACTLY ONE REPLACEMENT
+# ============================================================
+#
+# We need to identify the replacement cycle.
+#
+# If REPLACEMENT_CYCLE_COL already exists, use it.
+#
+# Otherwise, the code tries to identify the replacement from
+# the maximum normalized life.
+# ============================================================
+
+if REPLACEMENT_CYCLE_COL in work.columns:
+
+    replacement_cycle_per_esn = (
+        work.groupby(ESN_COL)[REPLACEMENT_CYCLE_COL]
+        .first()
+    )
+
+    # Keep ESNs where replacement cycle is valid
+    valid_replacement_esns = (
+        replacement_cycle_per_esn
+        .dropna()
+        .index
+    )
+
+else:
+
+    # Fallback:
+    # assume the final observation corresponds to replacement
+    #
+    # This is ONLY a fallback.
+    # Prefer using the actual replacement cycle if you have it.
+
+    replacement_cycle_per_esn = (
+        work.groupby(ESN_COL)[LIFE_COL]
+        .max()
+    )
+
+    valid_replacement_esns = (
+        replacement_cycle_per_esn
+        .dropna()
+        .index
+    )
+
+
+work = work[
+    work[ESN_COL].isin(valid_replacement_esns)
+].copy()
+
+
+print(
+    f"Number of ESNs used: "
+    f"{work[ESN_COL].nunique()}"
+)
+
+
+# ============================================================
+# 5. CREATE RESULT STORAGE
+# ============================================================
+
+threshold_results = []
+
+esn_results = []
+
+summary_results = []
+
+
+# ============================================================
+# 6. PROCESS EACH ESN SEPARATELY
+# ============================================================
+
+for esn, esn_df in work.groupby(ESN_COL):
+
+    esn_df = esn_df.copy()
+
+    # --------------------------------------------------------
+    # Sort by normalized engine life
+    # --------------------------------------------------------
+
+    esn_df = esn_df.sort_values(
+        LIFE_COL
+    ).reset_index(drop=True)
+
+
+    # --------------------------------------------------------
+    # Identify replacement point
+    # --------------------------------------------------------
+
+    if REPLACEMENT_CYCLE_COL in esn_df.columns:
+
+        replacement_cycle = (
+            esn_df[REPLACEMENT_CYCLE_COL]
+            .dropna()
+            .iloc[0]
+            if esn_df[REPLACEMENT_CYCLE_COL].notna().any()
+            else np.nan
+        )
+
+    else:
+
+        # fallback = maximum normalized life
+        replacement_cycle = (
+            esn_df[LIFE_COL].max()
+        )
+
+
+    # --------------------------------------------------------
+    # PRE-REPLACEMENT DATA
+    # --------------------------------------------------------
+    #
+    # For this analysis we don't use post-replacement data
+    # to calculate the thresholds.
+    # --------------------------------------------------------
+
+    pre = esn_df[
+        esn_df[LIFE_COL] < replacement_cycle
+    ].copy()
+
+
+    # If replacement_cycle is actually normalized life
+    # rather than physical cycle, this is still handled because
+    # we use normalized life as the x-axis.
+    #
+    # If the resulting pre dataframe is empty, use everything
+    # except the last point.
+
+    if len(pre) < 5:
+
+        pre = esn_df.iloc[:-1].copy()
+
+
+    # --------------------------------------------------------
+    # HEALTHY REGION
+    # --------------------------------------------------------
+
+    healthy = pre[
+        (pre[LIFE_COL] >= HEALTHY_START) &
+        (pre[LIFE_COL] <= HEALTHY_END)
+    ].copy()
+
+
+    # --------------------------------------------------------
+    # Safety check
+    # --------------------------------------------------------
+
+    if len(healthy) < 5:
+
+        print(
+            f"Skipping ESN {esn}: "
+            f"only {len(healthy)} points in healthy region."
+        )
+
+        continue
+
+
+    # ========================================================
+    # 7. CALCULATE HEALTHY PERCENTILES
+    # ========================================================
+
+    healthy_scores = healthy[EMA_COL].dropna()
+
+    percentile_values = np.percentile(
+        healthy_scores,
+        PERCENTILES
+    )
+
+
+    # Remove duplicate percentile boundaries.
+    #
+    # This can happen if many healthy values are identical.
+    # ========================================================
+
+    unique_thresholds = np.unique(
+        percentile_values
+    )
+
+
+    # --------------------------------------------------------
+    # Save thresholds
+    # --------------------------------------------------------
+
+    threshold_row = {
+        ESN_COL: esn,
+        "Healthy_Count": len(healthy),
+    }
+
+    for p, value in zip(
+        PERCENTILES,
+        percentile_values
+    ):
+        threshold_row[
+            f"P{int(p)}"
+        ] = value
+
+    threshold_results.append(
+        threshold_row
+    )
+
+
+    # ========================================================
+    # 8. CREATE STEP-FUNCTION BINS
+    # ========================================================
+    #
+    # np.digitize assigns each EMA score to a state.
+    #
+    # Example:
+    #
+    # below P50       -> Bin 1
+    # P50-P70         -> Bin 2
+    # P70-P80         -> Bin 3
+    # P80-P90         -> Bin 4
+    # P90-P95         -> Bin 5
+    # above P95       -> Bin 6
+    #
+    # NOTE:
+    # These are RELATIVE TO THE HEALTHY DISTRIBUTION of THIS ESN.
+    # ========================================================
+
+    bin_edges = percentile_values[1:-1]
+
+
+    pre["Degradation_Bin"] = (
+        np.digitize(
+            pre[EMA_COL],
+            bins=bin_edges,
+            right=False
+        ) + 1
+    )
+
+
+    # ========================================================
+    # 9. ADD BIN LABELS
+    # ========================================================
+
+    pre["Bin_Label"] = (
+        "Bin_" +
+        pre["Degradation_Bin"].astype(str)
+    )
+
+
+    # ========================================================
+    # 10. CALCULATE TIME SPENT IN EACH BIN
+    # ========================================================
+
+    bin_counts = (
+        pre["Degradation_Bin"]
+        .value_counts()
+        .sort_index()
+    )
+
+
+    # ========================================================
+    # 11. FIND MAXIMUM BIN REACHED
+    # ========================================================
+
+    max_bin = int(
+        pre["Degradation_Bin"].max()
+    )
+
+
+    # ========================================================
+    # 12. FIND FIRST POINT WHERE EACH BIN IS REACHED
+    # ========================================================
+
+    first_bin_cycle = {}
+
+    for b in sorted(
+        pre["Degradation_Bin"].unique()
+    ):
+
+        first_point = pre[
+            pre["Degradation_Bin"] == b
+        ].iloc[0]
+
+        first_bin_cycle[
+            f"Bin_{int(b)}_First_Life"
+        ] = first_point[LIFE_COL]
+
+
+    # ========================================================
+    # 13. SUMMARY
+    # ========================================================
+
+    summary_row = {
+        ESN_COL: esn,
+        "Healthy_Count": len(healthy),
+        "PreReplacement_Count": len(pre),
+        "Max_Bin_Reached": max_bin,
+        "Replacement_Life": replacement_cycle
+    }
+
+    summary_row.update(
+        first_bin_cycle
+    )
+
+    summary_results.append(
+        summary_row
+    )
+
+
+    # ========================================================
+    # 14. STORE ESN RESULT
+    # ========================================================
+
+    esn_results.append(
+        pre
+    )
+
+
+# ============================================================
+# 15. COMBINE RESULTS
+# ============================================================
+
+if not esn_results:
+
+    raise ValueError(
+        "No ESNs could be processed. "
+        "Check the replacement column and healthy region."
+    )
+
+
+step_function_df = pd.concat(
+    esn_results,
+    ignore_index=True
+)
+
+
+threshold_df = pd.DataFrame(
+    threshold_results
+)
+
+
+summary_df = pd.DataFrame(
+    summary_results
+)
+
+
+# ============================================================
+# 16. DISPLAY SUMMARY
+# ============================================================
+
+print("\n========================================")
+print("STEP-FUNCTION ANALYSIS COMPLETE")
+print("========================================")
+
+print(
+    f"\nESNs processed: "
+    f"{step_function_df[ESN_COL].nunique()}"
+)
+
+print(
+    f"Healthy region: "
+    f"{HEALTHY_START}% - {HEALTHY_END}%"
+)
+
+print(
+    "\nSummary:"
+)
+
+display(
+    summary_df
+)
+
+
+# ============================================================
+# 17. DISPLAY THRESHOLDS
+# ============================================================
+
+print("\nHealthy percentile thresholds:")
+
+display(
+    threshold_df
+)
+
+
+# ============================================================
+# 18. OVERALL DISTRIBUTION OF MAXIMUM BIN
+# ============================================================
+
+print(
+    "\nMaximum degradation bin reached "
+    "before replacement:"
+)
+
+display(
+    summary_df[
+        "Max_Bin_Reached"
+    ].value_counts()
+    .sort_index()
+    .rename("Number_of_ESNs")
+    .to_frame()
+)
+
+
+# ============================================================
+# 19. PLOT INDIVIDUAL ESNs
+# ============================================================
+#
+# Plot:
+#
+# TOP:
+# EMA Mahalanobis score
+#
+# BOTTOM:
+# Step-function degradation state
+#
+# Dashed vertical line:
+# replacement
+# ============================================================
+
+for esn in step_function_df[ESN_COL].unique():
+
+    plot_df = step_function_df[
+        step_function_df[ESN_COL] == esn
+    ].sort_values(
+        LIFE_COL
+    )
+
+    threshold_row = threshold_df[
+        threshold_df[ESN_COL] == esn
+    ].iloc[0]
+
+
+    # --------------------------------------------------------
+    # Extract thresholds
+    # --------------------------------------------------------
+
+    p50 = threshold_row["P50"]
+    p70 = threshold_row["P70"]
+    p80 = threshold_row["P80"]
+    p90 = threshold_row["P90"]
+    p95 = threshold_row["P95"]
+
+
+    replacement_life = (
+        summary_df[
+            summary_df[ESN_COL] == esn
+        ]["Replacement_Life"]
+        .iloc[0]
+    )
+
+
+    # ========================================================
+    # CREATE FIGURE
+    # ========================================================
+
+    fig, axes = plt.subplots(
+        2,
+        1,
+        figsize=(13, 8),
+        sharex=True
+    )
+
+
+    # ========================================================
+    # TOP PLOT: EMA MAHALANOBIS
+    # ========================================================
+
+    axes[0].plot(
+        plot_df[LIFE_COL],
+        plot_df[EMA_COL],
+        linewidth=1.8,
+        label="EMA Mahalanobis"
+    )
+
+
+    # Healthy percentile thresholds
+
+    axes[0].axhline(
+        p50,
+        linestyle="--",
+        linewidth=1,
+        label="Healthy P50"
+    )
+
+    axes[0].axhline(
+        p70,
+        linestyle="--",
+        linewidth=1,
+        label="Healthy P70"
+    )
+
+    axes[0].axhline(
+        p80,
+        linestyle="--",
+        linewidth=1,
+        label="Healthy P80"
+    )
+
+    axes[0].axhline(
+        p90,
+        linestyle="--",
+        linewidth=1,
+        label="Healthy P90"
+    )
+
+    axes[0].axhline(
+        p95,
+        linestyle="--",
+        linewidth=1,
+        label="Healthy P95"
+    )
+
+
+    # Replacement point
+
+    axes[0].axvline(
+        replacement_life,
+        linestyle=":",
+        linewidth=2,
+        label="Replacement"
+    )
+
+
+    axes[0].set_ylabel(
+        "EMA Mahalanobis"
+    )
+
+    axes[0].set_title(
+        f"ESN {esn} — EMA Mahalanobis vs Normalized Life"
+    )
+
+    axes[0].legend(
+        fontsize=8,
+        ncol=3
+    )
+
+    axes[0].grid(
+        alpha=0.25
+    )
+
+
+    # ========================================================
+    # BOTTOM: STEP FUNCTION
+    # ========================================================
+
+    axes[1].step(
+        plot_df[LIFE_COL],
+        plot_df["Degradation_Bin"],
+        where="post",
+        linewidth=2
+    )
+
+
+    axes[1].axvline(
+        replacement_life,
+        linestyle=":",
+        linewidth=2,
+        label="Replacement"
+    )
+
+
+    axes[1].set_xlabel(
+        "Normalized Engine Life (%)"
+    )
+
+    axes[1].set_ylabel(
+        "Degradation Bin"
+    )
+
+    axes[1].set_title(
+        "Step-Function Degradation State"
+    )
+
+
+    # Force integer bins
+
+    axes[1].set_yticks(
+        sorted(
+            plot_df[
+                "Degradation_Bin"
+            ].unique()
+        )
+    )
+
+
+    axes[1].grid(
+        alpha=0.25
+    )
+
+    axes[1].legend()
+
+
+    plt.tight_layout()
+
+    plt.show()
+
+
+# ============================================================
+# 20. CREATE AN OVERALL BIN TRANSITION PLOT
+# ============================================================
+#
+# This lets us visually see whether ESNs tend to move through
+# increasingly higher bins as they approach replacement.
+# ============================================================
+
+plt.figure(
+    figsize=(14, 8)
+)
+
+
+for esn in step_function_df[ESN_COL].unique():
+
+    plot_df = step_function_df[
+        step_function_df[ESN_COL] == esn
+    ].sort_values(
+        LIFE_COL
+    )
+
+    plt.step(
+        plot_df[LIFE_COL],
+        plot_df["Degradation_Bin"],
+        where="post",
+        alpha=0.35
+    )
+
+
+plt.xlabel(
+    "Normalized Engine Life (%)"
+)
+
+plt.ylabel(
+    "Degradation Bin"
+)
+
+plt.title(
+    "Breather Degradation Bin Transitions Across ESNs"
+)
+
+plt.grid(
+    alpha=0.25
+)
+
+plt.tight_layout()
+
+plt.show()
+
+
+# ============================================================
+# 21. IMPORTANT OUTPUT OBJECTS
+# ============================================================
+#
+# step_function_df
+#     -> Every pre-replacement observation + degradation bin
+#
+# threshold_df
+#     -> Healthy percentile thresholds for every ESN
+#
+# summary_df
+#     -> Maximum bin reached and first life point of each bin
+#
+# ============================================================
+
+print("\nAvailable output dataframes:")
+
+print("1. step_function_df")
+print("2. threshold_df")
+print("3. summary_df")
