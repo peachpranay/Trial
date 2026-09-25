@@ -1,0 +1,1783 @@
+# ============================================================
+# BREATHER DEGRADATION ANALYSIS
+# STARTING FROM YOUR EXISTING df_merged
+# ============================================================
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.covariance import EmpiricalCovariance
+
+import warnings
+warnings.filterwarnings("ignore")
+
+
+# ============================================================
+# 1. PARAMETERS TO USE
+# ============================================================
+
+FEATURE_COLS = [
+    'NH_PC',
+    'P25_PSI',
+    'T25_DEGC',
+    'OIP_PSI',
+    'OIQ_PSI',
+    'OIT_DEGC',
+    'OSDP_PSI',
+    'OSDP_EXP_PSI',
+    'BQ42_FID'
+]
+
+ESN_COL = 'ESN'
+DATE_COL = 'DATETIME'
+REPLACEMENT_DATE_COL = 'Breather/EGB Replacement Date'
+RUN_COL = 'Run_Number'
+
+
+# ============================================================
+# 2. SETTINGS
+# ============================================================
+
+# EMA applied to EACH of the 9 parameters
+EMA_SPAN = 5
+
+# Healthy region
+HEALTHY_START = 20
+HEALTHY_END = 60
+
+# Minimum healthy observations needed for an ESN
+MIN_HEALTHY_POINTS = 10
+
+# Percentiles used for step-function bins
+PERCENTILES = [50, 70, 80, 90, 95]
+
+
+# ============================================================
+# 3. CHECK COLUMNS
+# ============================================================
+
+required_columns = (
+    [ESN_COL, DATE_COL, REPLACEMENT_DATE_COL]
+    + FEATURE_COLS
+)
+
+missing_columns = [
+    col for col in required_columns
+    if col not in df_merged.columns
+]
+
+if missing_columns:
+
+    print("Missing columns:")
+    print(missing_columns)
+
+    print("\nAvailable columns:")
+    print(df_merged.columns.tolist())
+
+    raise ValueError(
+        "Please check the column names above."
+    )
+
+print("All required columns are present.")
+
+
+# ============================================================
+# 4. COPY DATA
+# ============================================================
+
+data = df_merged.copy()
+
+
+# ============================================================
+# 5. CONVERT DATES
+# ============================================================
+
+data[DATE_COL] = pd.to_datetime(
+    data[DATE_COL],
+    errors='coerce'
+)
+
+data[REPLACEMENT_DATE_COL] = pd.to_datetime(
+    data[REPLACEMENT_DATE_COL],
+    errors='coerce'
+)
+
+
+# ============================================================
+# 6. CONVERT PARAMETERS TO NUMERIC
+# ============================================================
+
+for col in FEATURE_COLS:
+
+    data[col] = pd.to_numeric(
+        data[col],
+        errors='coerce'
+    )
+
+
+# Remove rows without ESN/date/replacement date
+
+data = data.dropna(
+    subset=[
+        ESN_COL,
+        DATE_COL,
+        REPLACEMENT_DATE_COL
+    ]
+).copy()
+
+
+# ============================================================
+# 7. SORT BY ESN + DATETIME
+# ============================================================
+
+data = data.sort_values(
+    [ESN_COL, DATE_COL]
+).reset_index(drop=True)
+
+
+print("\nTotal rows:", len(data))
+print("Total ESNs:", data[ESN_COL].nunique())
+
+
+# ============================================================
+# 8. KEEP ONLY DATA BEFORE REPLACEMENT
+# ============================================================
+#
+# IMPORTANT:
+#
+# The replacement date belongs to the breather replacement
+# event.
+#
+# Everything before that date = degradation trajectory.
+#
+# Everything after that date = NOT used for the degradation
+# model.
+#
+# ============================================================
+
+before = data[
+    data[DATE_COL] <
+    data[REPLACEMENT_DATE_COL]
+].copy()
+
+
+after = data[
+    data[DATE_COL] >=
+    data[REPLACEMENT_DATE_COL]
+].copy()
+
+
+print("\n========================================")
+print("BEFORE / AFTER REPLACEMENT")
+print("========================================")
+
+print(
+    "Before replacement rows:",
+    len(before)
+)
+
+print(
+    "After replacement rows:",
+    len(after)
+)
+
+
+# ============================================================
+# 9. APPLY EMA TO EACH OF THE 9 PARAMETERS
+# ============================================================
+#
+# EMA is calculated separately for EVERY ESN.
+#
+# This is very important.
+#
+# We do NOT allow one ESN's data to influence another ESN.
+#
+# ============================================================
+
+for col in FEATURE_COLS:
+
+    ema_col = col + '_EMA'
+
+    before[ema_col] = (
+        before
+        .groupby(ESN_COL)[col]
+        .transform(
+            lambda x:
+            x.ewm(
+                span=EMA_SPAN,
+                adjust=False,
+                min_periods=1
+            ).mean()
+        )
+    )
+
+
+EMA_FEATURE_COLS = [
+    col + '_EMA'
+    for col in FEATURE_COLS
+]
+
+
+print("\nEMA columns created:")
+
+for col in EMA_FEATURE_COLS:
+    print(col)
+
+
+# ============================================================
+# 10. NORMALIZE ENGINE LIFE FOR EACH ESN
+# ============================================================
+#
+# First observation:
+#       0%
+#
+# Last observation before replacement:
+#       100%
+#
+# This lets us compare engines having different cycle lengths.
+#
+# ============================================================
+
+def normalize_life(group):
+
+    group = group.sort_values(
+        DATE_COL
+    ).copy()
+
+    first_date = group[DATE_COL].min()
+    last_date = group[DATE_COL].max()
+
+    if first_date == last_date:
+
+        group['Normalized_Life'] = 0.0
+
+    else:
+
+        group['Normalized_Life'] = (
+            (
+                group[DATE_COL] - first_date
+            ).dt.total_seconds()
+            /
+            (
+                last_date - first_date
+            ).total_seconds()
+            * 100
+        )
+
+    return group
+
+
+before = (
+    before
+    .groupby(
+        ESN_COL,
+        group_keys=False
+    )
+    .apply(normalize_life)
+    .reset_index(drop=True)
+)
+
+
+# ============================================================
+# 11. REMOVE ROWS WITH MISSING EMA FEATURES
+# ============================================================
+
+before = before.dropna(
+    subset=EMA_FEATURE_COLS
+).copy()
+
+
+print(
+    "\nRows after EMA cleaning:",
+    len(before)
+)
+
+
+# ============================================================
+# 12. HEALTHY BASELINE + MAHALANOBIS
+# ============================================================
+#
+# For EACH ESN separately:
+#
+#       20–60% normalized life
+#                 ↓
+#        healthy distribution
+#                 ↓
+#        mean + covariance
+#                 ↓
+#      Mahalanobis distance
+#
+# The healthy baseline NEVER uses data after 60%.
+#
+# ============================================================
+
+mahal_results = []
+baseline_results = []
+skipped_esns = []
+
+
+for esn, esn_data in before.groupby(ESN_COL):
+
+    esn_data = esn_data.sort_values(
+        DATE_COL
+    ).copy()
+
+
+    # --------------------------------------------------------
+    # Healthy region
+    # --------------------------------------------------------
+
+    healthy = esn_data[
+        (
+            esn_data['Normalized_Life']
+            >= HEALTHY_START
+        )
+        &
+        (
+            esn_data['Normalized_Life']
+            <= HEALTHY_END
+        )
+    ].copy()
+
+
+    # --------------------------------------------------------
+    # Check number of healthy observations
+    # --------------------------------------------------------
+
+    if len(healthy) < MIN_HEALTHY_POINTS:
+
+        skipped_esns.append(
+            {
+                ESN_COL: esn,
+                'Healthy_Count': len(healthy)
+            }
+        )
+
+        continue
+
+
+    # --------------------------------------------------------
+    # Healthy EMA feature matrix
+    # --------------------------------------------------------
+
+    X_healthy = (
+        healthy[EMA_FEATURE_COLS]
+        .astype(float)
+        .values
+    )
+
+
+    X_all = (
+        esn_data[EMA_FEATURE_COLS]
+        .astype(float)
+        .values
+    )
+
+
+    # --------------------------------------------------------
+    # Standardize using ONLY healthy data
+    # --------------------------------------------------------
+
+    scaler = StandardScaler()
+
+    X_healthy_scaled = (
+        scaler.fit_transform(
+            X_healthy
+        )
+    )
+
+    X_all_scaled = (
+        scaler.transform(
+            X_all
+        )
+    )
+
+
+    # --------------------------------------------------------
+    # Fit healthy covariance
+    # --------------------------------------------------------
+
+    covariance_model = EmpiricalCovariance(
+        assume_centered=False
+    )
+
+    covariance_model.fit(
+        X_healthy_scaled
+    )
+
+
+    # --------------------------------------------------------
+    # Mahalanobis distance
+    # --------------------------------------------------------
+
+    mahal_squared = (
+        covariance_model
+        .mahalanobis(
+            X_all_scaled
+        )
+    )
+
+
+    mahal_distance = np.sqrt(
+        np.maximum(
+            mahal_squared,
+            0
+        )
+    )
+
+
+    esn_data[
+        'Mahalanobis_Distance'
+    ] = mahal_distance
+
+
+    # --------------------------------------------------------
+    # Save baseline information
+    # --------------------------------------------------------
+
+    baseline_row = {
+        ESN_COL: esn,
+        'Healthy_Count': len(healthy)
+    }
+
+
+    for i, feature in enumerate(
+        FEATURE_COLS
+    ):
+
+        baseline_row[
+            feature + '_Healthy_Mean'
+        ] = scaler.mean_[i]
+
+        baseline_row[
+            feature + '_Healthy_STD'
+        ] = scaler.scale_[i]
+
+
+    baseline_results.append(
+        baseline_row
+    )
+
+
+    mahal_results.append(
+        esn_data
+    )
+
+
+# ============================================================
+# 13. COMBINE MAHALANOBIS RESULTS
+# ============================================================
+
+if len(mahal_results) == 0:
+
+    raise ValueError(
+        "No ESNs could be processed. "
+        "Check your healthy region and data."
+    )
+
+
+result_df = pd.concat(
+    mahal_results,
+    ignore_index=True
+)
+
+
+baseline_df = pd.DataFrame(
+    baseline_results
+)
+
+
+print("\n========================================")
+print("MAHALANOBIS COMPLETE")
+print("========================================")
+
+print(
+    "ESNs successfully processed:",
+    result_df[ESN_COL].nunique()
+)
+
+print(
+    "ESNs skipped:",
+    len(skipped_esns)
+)
+
+
+# ============================================================
+# 14. IMPORTANT:
+#     WE DO NOT APPLY ANOTHER EMA TO MAHALANOBIS
+# ============================================================
+#
+# Why?
+#
+# The 9 parameters have already been EMA-smoothed.
+#
+# Then Mahalanobis measures their multivariate deviation.
+#
+# Applying EMA again to Mahalanobis would create:
+#
+#       Raw
+#        ↓
+#       EMA
+#        ↓
+#       Mahalanobis
+#        ↓
+#       EMA AGAIN
+#
+# which may over-smooth the degradation signal.
+#
+# Therefore:
+#
+#       EMA parameters
+#              ↓
+#       Mahalanobis
+#              ↓
+#       Step function
+#
+# ============================================================
+
+
+# ============================================================
+# 15. CALCULATE HEALTHY MAHALANOBIS PERCENTILES
+# ============================================================
+#
+# These are calculated separately for EACH ESN.
+#
+# Healthy distribution = 20–60% life.
+#
+# ============================================================
+
+threshold_results = []
+step_results = []
+
+
+for esn, esn_data in result_df.groupby(
+    ESN_COL
+):
+
+    esn_data = esn_data.sort_values(
+        DATE_COL
+    ).copy()
+
+
+    healthy_scores = esn_data[
+        (
+            esn_data['Normalized_Life']
+            >= HEALTHY_START
+        )
+        &
+        (
+            esn_data['Normalized_Life']
+            <= HEALTHY_END
+        )
+    ]['Mahalanobis_Distance'].dropna()
+
+
+    if len(healthy_scores) < MIN_HEALTHY_POINTS:
+
+        continue
+
+
+    # --------------------------------------------------------
+    # Calculate thresholds
+    # --------------------------------------------------------
+
+    thresholds = {}
+
+    for p in PERCENTILES:
+
+        thresholds[
+            f'P{p}'
+        ] = np.percentile(
+            healthy_scores,
+            p
+        )
+
+
+    # --------------------------------------------------------
+    # Save thresholds
+    # --------------------------------------------------------
+
+    threshold_row = {
+        ESN_COL: esn,
+        'Healthy_Count': len(healthy_scores)
+    }
+
+    threshold_row.update(
+        thresholds
+    )
+
+    threshold_results.append(
+        threshold_row
+    )
+
+
+    # ========================================================
+    # 16. STEP FUNCTION
+    # ========================================================
+    #
+    # Bin 1 = below P50
+    # Bin 2 = P50–P70
+    # Bin 3 = P70–P80
+    # Bin 4 = P80–P90
+    # Bin 5 = P90–P95
+    # Bin 6 = above P95
+    #
+    # ========================================================
+
+    bin_edges = [
+        thresholds['P50'],
+        thresholds['P70'],
+        thresholds['P80'],
+        thresholds['P90'],
+        thresholds['P95']
+    ]
+
+
+    esn_data[
+        'Degradation_Bin'
+    ] = (
+        np.digitize(
+            esn_data[
+                'Mahalanobis_Distance'
+            ],
+            bins=bin_edges,
+            right=False
+        ) + 1
+    )
+
+
+    # --------------------------------------------------------
+    # Human-readable state
+    # --------------------------------------------------------
+
+    state_map = {
+
+        1: 'Healthy',
+
+        2: 'Low deviation',
+
+        3: 'Moderate deviation',
+
+        4: 'Elevated deviation',
+
+        5: 'High deviation',
+
+        6: 'Very high deviation'
+    }
+
+
+    esn_data[
+        'Degradation_State'
+    ] = (
+        esn_data[
+            'Degradation_Bin'
+        ].map(state_map)
+    )
+
+
+    step_results.append(
+        esn_data
+    )
+
+
+# ============================================================
+# 17. FINAL STEP-FUNCTION DATASET
+# ============================================================
+
+step_function_df = pd.concat(
+    step_results,
+    ignore_index=True
+)
+
+
+threshold_df = pd.DataFrame(
+    threshold_results
+)
+
+
+print("\n========================================")
+print("STEP FUNCTION COMPLETE")
+print("========================================")
+
+print(
+    "ESNs:",
+    step_function_df[ESN_COL].nunique()
+)
+
+
+# ============================================================
+# 18. PERSISTENCE ANALYSIS
+# ============================================================
+#
+# A single high bin can be noise.
+#
+# We therefore also calculate:
+#
+# consecutive observations spent in the same bin.
+#
+# And a persistent P95 crossing.
+#
+# ============================================================
+
+persistence_results = []
+
+
+for esn, esn_data in step_function_df.groupby(
+    ESN_COL
+):
+
+    esn_data = esn_data.sort_values(
+        DATE_COL
+    ).copy()
+
+
+    # --------------------------------------------------------
+    # Bin persistence
+    # --------------------------------------------------------
+
+    esn_data[
+        'Bin_Change'
+    ] = (
+        esn_data[
+            'Degradation_Bin'
+        ]
+        !=
+        esn_data[
+            'Degradation_Bin'
+        ].shift(1)
+    )
+
+
+    esn_data[
+        'Bin_Group'
+    ] = esn_data[
+        'Bin_Change'
+    ].cumsum()
+
+
+    esn_data[
+        'Consecutive_Bin_Count'
+    ] = (
+        esn_data
+        .groupby(
+            'Bin_Group'
+        )
+        .cumcount()
+        + 1
+    )
+
+
+    # --------------------------------------------------------
+    # P95 threshold
+    # --------------------------------------------------------
+
+    threshold_row = threshold_df[
+        threshold_df[ESN_COL] == esn
+    ].iloc[0]
+
+
+    p95 = threshold_row['P95']
+
+
+    # --------------------------------------------------------
+    # P95 crossing
+    # --------------------------------------------------------
+
+    p95_crossed = (
+        esn_data[
+            'Mahalanobis_Distance'
+        ]
+        >= p95
+    )
+
+
+    # --------------------------------------------------------
+    # Require 3 consecutive observations >= P95
+    # --------------------------------------------------------
+
+    esn_data[
+        'P95_Crossed'
+    ] = p95_crossed
+
+
+    esn_data[
+        'P95_Persistent'
+    ] = (
+        p95_crossed
+        .rolling(
+            window=3,
+            min_periods=3
+        )
+        .sum()
+        >= 3
+    )
+
+
+    persistence_results.append(
+        esn_data
+    )
+
+
+step_function_df = pd.concat(
+    persistence_results,
+    ignore_index=True
+)
+
+
+# ============================================================
+# 19. SUMMARY FOR EACH ESN
+# ============================================================
+
+summary_results = []
+
+
+for esn, esn_data in step_function_df.groupby(
+    ESN_COL
+):
+
+    esn_data = esn_data.sort_values(
+        DATE_COL
+    ).copy()
+
+
+    threshold_row = threshold_df[
+        threshold_df[ESN_COL] == esn
+    ].iloc[0]
+
+
+    p95 = threshold_row['P95']
+
+
+    # --------------------------------------------------------
+    # Maximum bin
+    # --------------------------------------------------------
+
+    max_bin = int(
+        esn_data[
+            'Degradation_Bin'
+        ].max()
+    )
+
+
+    # --------------------------------------------------------
+    # Last Mahalanobis score
+    # --------------------------------------------------------
+
+    last_score = (
+        esn_data[
+            'Mahalanobis_Distance'
+        ].iloc[-1]
+    )
+
+
+    # --------------------------------------------------------
+    # Maximum Mahalanobis
+    # --------------------------------------------------------
+
+    max_score = (
+        esn_data[
+            'Mahalanobis_Distance'
+        ].max()
+    )
+
+
+    # --------------------------------------------------------
+    # First P95 crossing
+    # --------------------------------------------------------
+
+    crossed = esn_data[
+        esn_data[
+            'Mahalanobis_Distance'
+        ] >= p95
+    ]
+
+
+    if len(crossed) > 0:
+
+        first_p95_life = (
+            crossed[
+                'Normalized_Life'
+            ].iloc[0]
+        )
+
+    else:
+
+        first_p95_life = np.nan
+
+
+    # --------------------------------------------------------
+    # First P95 persistent crossing
+    # --------------------------------------------------------
+
+    persistent = esn_data[
+        esn_data[
+            'P95_Persistent'
+        ]
+    ]
+
+
+    if len(persistent) > 0:
+
+        first_persistent_life = (
+            persistent[
+                'Normalized_Life'
+            ].iloc[0]
+        )
+
+    else:
+
+        first_persistent_life = np.nan
+
+
+    # --------------------------------------------------------
+    # Maximum consecutive high-bin duration
+    # --------------------------------------------------------
+
+    max_persistence = (
+        esn_data[
+            'Consecutive_Bin_Count'
+        ].max()
+    )
+
+
+    summary_results.append({
+
+        ESN_COL: esn,
+
+        'Max_Degradation_Bin':
+            max_bin,
+
+        'Last_Mahalanobis':
+            last_score,
+
+        'Max_Mahalanobis':
+            max_score,
+
+        'First_P95_Crossing_Life':
+            first_p95_life,
+
+        'First_Persistent_P95_Life':
+            first_persistent_life,
+
+        'Life_Remaining_At_P95':
+            (
+                100 - first_p95_life
+                if pd.notna(first_p95_life)
+                else np.nan
+            ),
+
+        'Life_Remaining_At_Persistent_P95':
+            (
+                100 - first_persistent_life
+                if pd.notna(first_persistent_life)
+                else np.nan
+            ),
+
+        'Max_Consecutive_Bin_Count':
+            max_persistence
+    })
+
+
+summary_df = pd.DataFrame(
+    summary_results
+)
+
+
+# ============================================================
+# 20. DISPLAY THRESHOLDS
+# ============================================================
+
+print("\n========================================")
+print("HEALTHY THRESHOLDS")
+print("========================================")
+
+display(
+    threshold_df
+)
+
+
+# ============================================================
+# 21. DISPLAY SUMMARY
+# ============================================================
+
+print("\n========================================")
+print("ESN SUMMARY")
+print("========================================")
+
+display(
+    summary_df
+)
+
+
+# ============================================================
+# 22. P95 EARLY WARNING STATISTICS
+# ============================================================
+
+valid_p95 = summary_df[
+    summary_df[
+        'First_P95_Crossing_Life'
+    ].notna()
+]
+
+
+print("\n========================================")
+print("P95 EARLY WARNING")
+print("========================================")
+
+
+print(
+    "ESNs crossing P95:",
+    len(valid_p95),
+    "/",
+    len(summary_df)
+)
+
+
+if len(valid_p95) > 0:
+
+    print(
+        "\nMedian life remaining at first P95:",
+        round(
+            valid_p95[
+                'Life_Remaining_At_P95'
+            ].median(),
+            2
+        ),
+        "%"
+    )
+
+
+    print(
+        "Mean life remaining at first P95:",
+        round(
+            valid_p95[
+                'Life_Remaining_At_P95'
+            ].mean(),
+            2
+        ),
+        "%"
+    )
+
+
+# ============================================================
+# 23. GRAPH 1
+#     RAW PARAMETERS VS EMA
+# ============================================================
+#
+# This lets you visually verify whether EMA is doing what
+# we expect.
+#
+# ============================================================
+
+# Pick first processed ESN
+
+example_esn = (
+    step_function_df[
+        ESN_COL
+    ].iloc[0]
+)
+
+
+example_data = step_function_df[
+    step_function_df[ESN_COL] == example_esn
+].sort_values(
+    DATE_COL
+)
+
+
+for feature in FEATURE_COLS:
+
+    ema_feature = feature + '_EMA'
+
+
+    plt.figure(
+        figsize=(14, 5)
+    )
+
+
+    plt.plot(
+        example_data[
+            'Normalized_Life'
+        ],
+        example_data[
+            feature
+        ],
+        alpha=0.35,
+        label='Raw'
+    )
+
+
+    plt.plot(
+        example_data[
+            'Normalized_Life'
+        ],
+        example_data[
+            ema_feature
+        ],
+        linewidth=2,
+        label='EMA'
+    )
+
+
+    plt.axvspan(
+        HEALTHY_START,
+        HEALTHY_END,
+        alpha=0.12,
+        label='Healthy baseline'
+    )
+
+
+    plt.xlabel(
+        'Normalized Engine Life (%)'
+    )
+
+    plt.ylabel(
+        feature
+    )
+
+    plt.title(
+        f'ESN {example_esn} — '
+        f'{feature}: Raw vs EMA'
+    )
+
+    plt.legend()
+
+    plt.grid(
+        alpha=0.25
+    )
+
+    plt.tight_layout()
+
+    plt.show()
+
+
+# ============================================================
+# 24. GRAPH 2
+#     MAHALANOBIS TRAJECTORY
+# ============================================================
+
+for esn in step_function_df[
+    ESN_COL
+].unique():
+
+    esn_data = step_function_df[
+        step_function_df[ESN_COL] == esn
+    ].sort_values(
+        DATE_COL
+    )
+
+
+    threshold_row = threshold_df[
+        threshold_df[ESN_COL] == esn
+    ].iloc[0]
+
+
+    p95 = threshold_row['P95']
+
+
+    plt.figure(
+        figsize=(14, 6)
+    )
+
+
+    plt.plot(
+        esn_data[
+            'Normalized_Life'
+        ],
+        esn_data[
+            'Mahalanobis_Distance'
+        ],
+        linewidth=2,
+        label='Mahalanobis'
+    )
+
+
+    plt.axhline(
+        p95,
+        linestyle='--',
+        linewidth=2,
+        label='Healthy P95'
+    )
+
+
+    plt.axvspan(
+        HEALTHY_START,
+        HEALTHY_END,
+        alpha=0.12,
+        label='Healthy baseline'
+    )
+
+
+    plt.xlabel(
+        'Normalized Engine Life (%)'
+    )
+
+    plt.ylabel(
+        'Mahalanobis Distance'
+    )
+
+    plt.title(
+        f'ESN {esn} — Mahalanobis Degradation Trajectory'
+    )
+
+    plt.legend()
+
+    plt.grid(
+        alpha=0.25
+    )
+
+    plt.tight_layout()
+
+    plt.show()
+
+
+# ============================================================
+# 25. GRAPH 3
+#     STEP FUNCTION FOR EACH ESN
+# ============================================================
+
+for esn in step_function_df[
+    ESN_COL
+].unique():
+
+    esn_data = step_function_df[
+        step_function_df[ESN_COL] == esn
+    ].sort_values(
+        DATE_COL
+    )
+
+
+    replacement_life = (
+        esn_data[
+            'Normalized_Life'
+        ].max()
+    )
+
+
+    plt.figure(
+        figsize=(14, 6)
+    )
+
+
+    plt.step(
+        esn_data[
+            'Normalized_Life'
+        ],
+        esn_data[
+            'Degradation_Bin'
+        ],
+        where='post',
+        linewidth=2
+    )
+
+
+    plt.axvspan(
+        HEALTHY_START,
+        HEALTHY_END,
+        alpha=0.12,
+        label='Healthy baseline'
+    )
+
+
+    plt.axvline(
+        replacement_life,
+        linestyle=':',
+        linewidth=2,
+        label='Replacement'
+    )
+
+
+    plt.xlabel(
+        'Normalized Engine Life (%)'
+    )
+
+    plt.ylabel(
+        'Degradation Bin'
+    )
+
+    plt.title(
+        f'ESN {esn} — Breather Step-Function Degradation'
+    )
+
+
+    plt.yticks(
+        range(1, 7),
+        [
+            '1 - Healthy',
+            '2 - Low',
+            '3 - Moderate',
+            '4 - Elevated',
+            '5 - High',
+            '6 - Very High'
+        ]
+    )
+
+
+    plt.legend()
+
+    plt.grid(
+        alpha=0.25
+    )
+
+    plt.tight_layout()
+
+    plt.show()
+
+
+# ============================================================
+# 26. GRAPH 4
+#     MAHALANOBIS + STEP FUNCTION TOGETHER
+# ============================================================
+#
+# THIS IS THE MOST IMPORTANT GRAPH.
+#
+# Top:
+#     continuous degradation score
+#
+# Bottom:
+#     discrete degradation state
+#
+# ============================================================
+
+for esn in step_function_df[
+    ESN_COL
+].unique():
+
+    esn_data = step_function_df[
+        step_function_df[ESN_COL] == esn
+    ].sort_values(
+        DATE_COL
+    )
+
+
+    threshold_row = threshold_df[
+        threshold_df[ESN_COL] == esn
+    ].iloc[0]
+
+
+    p50 = threshold_row['P50']
+    p70 = threshold_row['P70']
+    p80 = threshold_row['P80']
+    p90 = threshold_row['P90']
+    p95 = threshold_row['P95']
+
+
+    replacement_life = (
+        esn_data[
+            'Normalized_Life'
+        ].max()
+    )
+
+
+    fig, axes = plt.subplots(
+        2,
+        1,
+        figsize=(15, 9),
+        sharex=True
+    )
+
+
+    # --------------------------------------------------------
+    # TOP
+    # --------------------------------------------------------
+
+    axes[0].plot(
+        esn_data[
+            'Normalized_Life'
+        ],
+        esn_data[
+            'Mahalanobis_Distance'
+        ],
+        linewidth=2,
+        label='Mahalanobis'
+    )
+
+
+    axes[0].axhline(
+        p50,
+        linestyle='--',
+        linewidth=1,
+        label='P50'
+    )
+
+    axes[0].axhline(
+        p70,
+        linestyle='--',
+        linewidth=1,
+        label='P70'
+    )
+
+    axes[0].axhline(
+        p80,
+        linestyle='--',
+        linewidth=1,
+        label='P80'
+    )
+
+    axes[0].axhline(
+        p90,
+        linestyle='--',
+        linewidth=1,
+        label='P90'
+    )
+
+    axes[0].axhline(
+        p95,
+        linestyle='--',
+        linewidth=2,
+        label='P95'
+    )
+
+
+    axes[0].axvspan(
+        HEALTHY_START,
+        HEALTHY_END,
+        alpha=0.12
+    )
+
+
+    axes[0].axvline(
+        replacement_life,
+        linestyle=':',
+        linewidth=2,
+        label='Replacement'
+    )
+
+
+    axes[0].set_ylabel(
+        'Mahalanobis'
+    )
+
+    axes[0].set_title(
+        f'ESN {esn} — Continuous + Step Degradation'
+    )
+
+    axes[0].legend(
+        ncol=4,
+        fontsize=8
+    )
+
+    axes[0].grid(
+        alpha=0.25
+    )
+
+
+    # --------------------------------------------------------
+    # BOTTOM
+    # --------------------------------------------------------
+
+    axes[1].step(
+        esn_data[
+            'Normalized_Life'
+        ],
+        esn_data[
+            'Degradation_Bin'
+        ],
+        where='post',
+        linewidth=2
+    )
+
+
+    axes[1].axvspan(
+        HEALTHY_START,
+        HEALTHY_END,
+        alpha=0.12
+    )
+
+
+    axes[1].axvline(
+        replacement_life,
+        linestyle=':',
+        linewidth=2
+    )
+
+
+    axes[1].set_xlabel(
+        'Normalized Engine Life (%)'
+    )
+
+    axes[1].set_ylabel(
+        'State'
+    )
+
+
+    axes[1].set_yticks(
+        range(1, 7)
+    )
+
+    axes[1].set_yticklabels([
+        'Healthy',
+        'Low',
+        'Moderate',
+        'Elevated',
+        'High',
+        'Very High'
+    ])
+
+
+    axes[1].grid(
+        alpha=0.25
+    )
+
+
+    plt.tight_layout()
+
+    plt.show()
+
+
+# ============================================================
+# 27. GRAPH 5
+#     ALL ESNs STEP FUNCTION
+# ============================================================
+
+plt.figure(
+    figsize=(15, 8)
+)
+
+
+for esn in step_function_df[
+    ESN_COL
+].unique():
+
+    esn_data = step_function_df[
+        step_function_df[ESN_COL] == esn
+    ].sort_values(
+        'Normalized_Life'
+    )
+
+
+    plt.step(
+        esn_data[
+            'Normalized_Life'
+        ],
+        esn_data[
+            'Degradation_Bin'
+        ],
+        where='post',
+        alpha=0.35
+    )
+
+
+plt.axvspan(
+    HEALTHY_START,
+    HEALTHY_END,
+    alpha=0.12,
+    label='Healthy baseline'
+)
+
+
+plt.xlabel(
+    'Normalized Engine Life (%)'
+)
+
+plt.ylabel(
+    'Degradation Bin'
+)
+
+plt.title(
+    'Breather Degradation Step-Function Across ESNs'
+)
+
+plt.yticks(
+    range(1, 7)
+)
+
+plt.grid(
+    alpha=0.25
+)
+
+plt.legend()
+
+plt.tight_layout()
+
+plt.show()
+
+
+# ============================================================
+# 28. GRAPH 6
+#     WHEN DOES EACH ESN CROSS P95?
+# ============================================================
+
+plot_p95 = summary_df.dropna(
+    subset=[
+        'First_P95_Crossing_Life'
+    ]
+).copy()
+
+
+if len(plot_p95) > 0:
+
+    plot_p95 = plot_p95.sort_values(
+        'First_P95_Crossing_Life'
+    )
+
+
+    plt.figure(
+        figsize=(14, 7)
+    )
+
+
+    plt.bar(
+        plot_p95[
+            ESN_COL
+        ].astype(str),
+        plot_p95[
+            'Life_Remaining_At_P95'
+        ]
+    )
+
+
+    plt.axhline(
+        0,
+        linewidth=1
+    )
+
+
+    plt.xlabel(
+        'ESN'
+    )
+
+    plt.ylabel(
+        'Life Remaining at First P95 Crossing (%)'
+    )
+
+    plt.title(
+        'Early Warning: Life Remaining When Healthy P95 Is Crossed'
+    )
+
+    plt.xticks(
+        rotation=90
+    )
+
+    plt.grid(
+        axis='y',
+        alpha=0.25
+    )
+
+    plt.tight_layout()
+
+    plt.show()
+
+
+# ============================================================
+# 29. GRAPH 7
+#     DISTRIBUTION OF MAXIMUM DEGRADATION BIN
+# ============================================================
+
+max_bin_counts = (
+    summary_df[
+        'Max_Degradation_Bin'
+    ]
+    .value_counts()
+    .sort_index()
+)
+
+
+plt.figure(
+    figsize=(10, 6)
+)
+
+
+plt.bar(
+    max_bin_counts.index.astype(str),
+    max_bin_counts.values
+)
+
+
+plt.xlabel(
+    'Maximum Degradation Bin Reached'
+)
+
+plt.ylabel(
+    'Number of ESNs'
+)
+
+plt.title(
+    'Maximum Degradation State Before Replacement'
+)
+
+plt.grid(
+    axis='y',
+    alpha=0.25
+)
+
+plt.tight_layout()
+
+plt.show()
+
+
+# ============================================================
+# 30. SAVE RESULTS
+# ============================================================
+
+step_function_df.to_csv(
+    'breather_EMA_Mahalanobis_step_function.csv',
+    index=False
+)
+
+
+threshold_df.to_csv(
+    'breather_healthy_percentile_thresholds.csv',
+    index=False
+)
+
+
+summary_df.to_csv(
+    'breather_degradation_summary.csv',
+    index=False
+)
+
+
+baseline_df.to_csv(
+    'breather_ESN_healthy_baselines.csv',
+    index=False
+)
+
+
+print("\n========================================")
+print("ALL ANALYSIS COMPLETE")
+print("========================================")
+
+print(
+    "\nFiles created:"
+)
+
+print(
+    "1. breather_EMA_Mahalanobis_step_function.csv"
+)
+
+print(
+    "2. breather_healthy_percentile_thresholds.csv"
+)
+
+print(
+    "3. breather_degradation_summary.csv"
+)
+
+print(
+    "4. breather_ESN_healthy_baselines.csv"
+)
+
+
+# ============================================================
+# 31. FINAL PREVIEW
+# ============================================================
+
+print("\nFinal result preview:")
+
+display(
+    step_function_df[
+        [
+            ESN_COL,
+            DATE_COL,
+            'Normalized_Life',
+            'Mahalanobis_Distance',
+            'Degradation_Bin',
+            'Degradation_State',
+            'P95_Crossed',
+            'P95_Persistent'
+        ]
+    ].head(20)
+)
