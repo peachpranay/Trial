@@ -1,0 +1,368 @@
+# ============================================================
+# DOUBLE HEALTH INDEX THRESHOLD
+# ============================================================
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+# ------------------------------------------------------------
+# PARAMETERS
+# ------------------------------------------------------------
+
+BASELINE_START = 20
+BASELINE_END = 60
+
+HEALTH_MULTIPLIER = 2
+
+ROLLING_WINDOW = 5
+
+
+# ------------------------------------------------------------
+# USE THE CLEAN DATA FROM PREVIOUS CALCULATIONS
+# ------------------------------------------------------------
+
+data_for_threshold = anomaly_results_clean.copy()
+
+
+# ------------------------------------------------------------
+# MAKE SURE DATA IS SORTED
+# ------------------------------------------------------------
+
+data_for_threshold = (
+    data_for_threshold
+    .sort_values(['ESN', 'LIFE_PERCENT'])
+    .reset_index(drop=True)
+)
+
+
+# ------------------------------------------------------------
+# RESULTS STORAGE
+# ------------------------------------------------------------
+
+health_index_results = []
+
+
+# ------------------------------------------------------------
+# PROCESS EACH ESN
+# ------------------------------------------------------------
+
+for esn, df_esn in data_for_threshold.groupby('ESN'):
+
+    df_esn = df_esn.copy()
+
+    # --------------------------------------------------------
+    # Healthy baseline = 20–60% life
+    # --------------------------------------------------------
+
+    healthy_mask = (
+        (df_esn['LIFE_PERCENT'] >= BASELINE_START)
+        &
+        (df_esn['LIFE_PERCENT'] <= BASELINE_END)
+    )
+
+    healthy_data = df_esn.loc[
+        healthy_mask
+    ].copy()
+
+    if healthy_data.empty:
+        continue
+
+
+    # --------------------------------------------------------
+    # HEALTH INDEX
+    #
+    # Mean rolling Mahalanobis score during healthy life
+    # --------------------------------------------------------
+
+    health_index = (
+        healthy_data['ROLLING_SCORE']
+        .dropna()
+        .mean()
+    )
+
+    if pd.isna(health_index):
+        continue
+
+
+    # --------------------------------------------------------
+    # NEW THRESHOLD
+    #
+    # Threshold = 2 × Healthy Index
+    # --------------------------------------------------------
+
+    threshold = (
+        HEALTH_MULTIPLIER
+        * health_index
+    )
+
+
+    # --------------------------------------------------------
+    # ADD TO ESN DATA
+    # --------------------------------------------------------
+
+    df_esn['HEALTH_INDEX'] = health_index
+
+    df_esn['DOUBLE_HEALTH_THRESHOLD'] = threshold
+
+
+    # --------------------------------------------------------
+    # CHECK ABOVE THRESHOLD
+    # --------------------------------------------------------
+
+    df_esn['ABOVE_THRESHOLD'] = (
+        df_esn['ROLLING_SCORE']
+        >
+        threshold
+    )
+
+
+    # --------------------------------------------------------
+    # SUSTAINED EXCEEDANCE
+    #
+    # 5 consecutive points above threshold
+    # --------------------------------------------------------
+
+    df_esn['SUSTAINED_COUNT'] = (
+        df_esn['ABOVE_THRESHOLD']
+        .astype(int)
+        .rolling(
+            window=5,
+            min_periods=5
+        )
+        .sum()
+    )
+
+
+    df_esn['SUSTAINED_DEGRADATION'] = (
+        df_esn['SUSTAINED_COUNT']
+        >= 5
+    )
+
+
+    # --------------------------------------------------------
+    # FIND FIRST DETECTION
+    # --------------------------------------------------------
+
+    detection_data = df_esn[
+        df_esn['SUSTAINED_DEGRADATION']
+    ]
+
+    if not detection_data.empty:
+
+        first_detection = (
+            detection_data.iloc[0]
+        )
+
+        detection_life = (
+            first_detection['LIFE_PERCENT']
+        )
+
+        detection_cycle = (
+            first_detection['CYCLE_NUMBER']
+            if 'CYCLE_NUMBER'
+            in first_detection.index
+            else np.nan
+        )
+
+        detected = True
+
+    else:
+
+        detection_life = np.nan
+        detection_cycle = np.nan
+        detected = False
+
+
+    # --------------------------------------------------------
+    # SAVE SUMMARY
+    # --------------------------------------------------------
+
+    health_index_results.append({
+        'ESN': esn,
+        'HEALTH_INDEX': health_index,
+        'DOUBLE_HEALTH_THRESHOLD': threshold,
+        'DETECTED': detected,
+        'DETECTION_LIFE_PERCENT': detection_life,
+        'DETECTION_CYCLE': detection_cycle
+    })
+
+
+# ------------------------------------------------------------
+# COMBINE RESULTS
+# ------------------------------------------------------------
+
+double_health_summary = pd.DataFrame(
+    health_index_results
+)
+
+
+# ------------------------------------------------------------
+# DISPLAY SUMMARY
+# ------------------------------------------------------------
+
+print("=" * 70)
+print("DOUBLE HEALTH INDEX RESULTS")
+print("=" * 70)
+
+print(
+    "Total ESNs:",
+    len(double_health_summary)
+)
+
+print(
+    "Detected ESNs:",
+    double_health_summary['DETECTED'].sum()
+)
+
+print(
+    "Not detected ESNs:",
+    (~double_health_summary['DETECTED']).sum()
+)
+
+display(
+    double_health_summary.sort_values(
+        'DETECTION_LIFE_PERCENT'
+    )
+)
+
+
+# ============================================================
+# PLOT EACH ESN
+# ============================================================
+
+for esn in double_health_summary['ESN']:
+
+    df_plot = data_for_threshold[
+        data_for_threshold['ESN'] == esn
+    ].copy()
+
+    if df_plot.empty:
+        continue
+
+
+    # --------------------------------------------------------
+    # Get threshold
+    # --------------------------------------------------------
+
+    health_index = (
+        double_health_summary.loc[
+            double_health_summary['ESN'] == esn,
+            'HEALTH_INDEX'
+        ].iloc[0]
+    )
+
+    threshold = (
+        double_health_summary.loc[
+            double_health_summary['ESN'] == esn,
+            'DOUBLE_HEALTH_THRESHOLD'
+        ].iloc[0]
+    )
+
+
+    # --------------------------------------------------------
+    # Plot
+    # --------------------------------------------------------
+
+    plt.figure(
+        figsize=(12, 5)
+    )
+
+    plt.plot(
+        df_plot['LIFE_PERCENT'],
+        df_plot['MAHALANOBIS_SCORE'],
+        label='Mahalanobis Score',
+        alpha=0.35
+    )
+
+    plt.plot(
+        df_plot['LIFE_PERCENT'],
+        df_plot['ROLLING_SCORE'],
+        label='Rolling Mahalanobis',
+        linewidth=2
+    )
+
+    # --------------------------------------------------------
+    # Healthy index
+    # --------------------------------------------------------
+
+    plt.axhline(
+        y=health_index,
+        linestyle=':',
+        linewidth=2,
+        label='Health Index'
+    )
+
+
+    # --------------------------------------------------------
+    # 2 × Health Index threshold
+    # --------------------------------------------------------
+
+    plt.axhline(
+        y=threshold,
+        linestyle='--',
+        linewidth=2,
+        label='2 × Health Index'
+    )
+
+
+    # --------------------------------------------------------
+    # Healthy baseline region
+    # --------------------------------------------------------
+
+    plt.axvspan(
+        BASELINE_START,
+        BASELINE_END,
+        alpha=0.15,
+        label='Healthy baseline (20–60%)'
+    )
+
+
+    # --------------------------------------------------------
+    # Detection point
+    # --------------------------------------------------------
+
+    detection = df_plot[
+        df_plot['SUSTAINED_DEGRADATION']
+    ]
+
+    if not detection.empty:
+
+        detection_point = detection.iloc[0]
+
+        plt.axvline(
+            x=detection_point['LIFE_PERCENT'],
+            linestyle=':',
+            linewidth=2,
+            label=(
+                f"Detection "
+                f"({detection_point['LIFE_PERCENT']:.1f}%)"
+            )
+        )
+
+
+    # --------------------------------------------------------
+    # Labels
+    # --------------------------------------------------------
+
+    plt.title(
+        f'Mahalanobis Degradation Detection - ESN {esn}'
+    )
+
+    plt.xlabel(
+        'Life Percent (%)'
+    )
+
+    plt.ylabel(
+        'Mahalanobis Score'
+    )
+
+    plt.legend()
+
+    plt.grid(
+        alpha=0.3
+    )
+
+    plt.tight_layout()
+
+    plt.show()
