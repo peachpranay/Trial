@@ -1,0 +1,1057 @@
+# ============================================================
+# BREATHER DEGRADATION DETECTION
+# CYCLE-BASED LIFE + ROBUST MAHALANOBIS DISTANCE
+# ============================================================
+
+# ============================================================
+# 1. IMPORT LIBRARIES
+# ============================================================
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+from sklearn.covariance import MinCovDet
+
+
+# ============================================================
+# 2. PARAMETERS
+# ============================================================
+
+# EMA
+EMA_SPAN = 5
+
+# Healthy baseline
+BASELINE_START = 20
+BASELINE_END = 60
+
+# Rolling Mahalanobis
+ROLLING_WINDOW = 5
+
+# Threshold
+PERCENTILE = 95
+
+# Sustained degradation
+SUSTAINED_POINTS = 5
+
+# Minimum observations required for an ESN
+MIN_TOTAL_OBSERVATIONS = 20
+
+# Minimum healthy observations required
+MIN_BASELINE_OBSERVATIONS = 20
+
+
+# ============================================================
+# 3. SENSOR COLUMNS
+# ============================================================
+
+sensor_columns = [
+    'NH_PC',
+    'P25_PSI',
+    'T25_DEGC',
+    'OIP_PSI',
+    'OIQ_USQT',
+    'OIT_DEGC',
+    'OSDP_PSI',
+    'OSDP_EXP_PSI'
+]
+
+# Remove accidental duplicates
+sensor_columns = list(dict.fromkeys(sensor_columns))
+
+
+# ============================================================
+# 4. LOAD TAKEOFF DATA
+# ============================================================
+
+df = pd.read_csv("thedata.csv")
+
+
+# ============================================================
+# 5. LOAD REPLACEMENT DATA
+# ============================================================
+
+df_replacement = pd.read_csv(
+    "/Workspace/Users/pranay.rajvanshi@aerospace.rolls-royce.com/BR.csv"
+)
+
+
+# ============================================================
+# 6. SELECT REQUIRED COLUMNS
+# ============================================================
+
+selected_columns = [
+    'ESN',
+    'DATETIME',
+    'OPERATOR',
+    'DATE',
+    'TIME',
+    'NH_PC',
+    'P25_PSI',
+    'T25_DEGC',
+    'OIP_PSI',
+    'OIQ_USQT',
+    'OIT_DEGC',
+    'OSDP_PSI',
+    'OSDP_EXP_PSI',
+    'BQ42_FID',
+    'Run_Number'
+]
+
+# Remove duplicates
+selected_columns = list(dict.fromkeys(selected_columns))
+
+df = df[selected_columns].copy()
+
+
+# ============================================================
+# 7. CONVERT DATA TYPES
+# ============================================================
+
+df['DATETIME'] = pd.to_datetime(
+    df['DATETIME'],
+    errors='coerce'
+)
+
+df['DATE'] = pd.to_datetime(
+    df['DATE'],
+    errors='coerce'
+)
+
+df_replacement[
+    'Breather/EGB Replacement Date 1'
+] = pd.to_datetime(
+    df_replacement[
+        'Breather/EGB Replacement Date 1'
+    ],
+    errors='coerce'
+)
+
+
+# ============================================================
+# 8. CLEAN INVALID ROWS
+# ============================================================
+
+df = df.dropna(
+    subset=['ESN', 'DATETIME']
+).copy()
+
+df_replacement = df_replacement.dropna(
+    subset=[
+        'ESN',
+        'Breather/EGB Replacement Date 1'
+    ]
+).copy()
+
+
+# ============================================================
+# 9. MAKE RUN_NUMBER NUMERIC
+# ============================================================
+
+df['Run_Number'] = pd.to_numeric(
+    df['Run_Number'],
+    errors='coerce'
+)
+
+
+# ============================================================
+# 10. FILTER:
+#     KEEP ONLY ESNs WHERE MAX(RUN_NUMBER) == 1
+# ============================================================
+
+max_run_per_esn = (
+    df.groupby('ESN')['Run_Number']
+      .max()
+)
+
+valid_run_esns = max_run_per_esn[
+    max_run_per_esn == 1
+].index
+
+
+df = df[
+    df['ESN'].isin(valid_run_esns)
+].copy()
+
+
+print("=" * 70)
+print("STEP 1 - RUN NUMBER FILTER")
+print("=" * 70)
+
+print(
+    "ESNs with max Run_Number == 1:",
+    df['ESN'].nunique()
+)
+
+
+# ============================================================
+# 11. FIND ESNs WITH EXACTLY ONE REPLACEMENT
+# ============================================================
+
+replacement_count = (
+    df_replacement
+    .groupby('ESN')
+    .size()
+)
+
+single_replacement_esns = replacement_count[
+    replacement_count == 1
+].index
+
+
+df_replacement_unique = df_replacement[
+    df_replacement['ESN'].isin(
+        single_replacement_esns
+    )
+].copy()
+
+
+print("\n" + "=" * 70)
+print("STEP 2 - SINGLE REPLACEMENT FILTER")
+print("=" * 70)
+
+print(
+    "ESNs with exactly one replacement:",
+    df_replacement_unique['ESN'].nunique()
+)
+
+
+# ============================================================
+# 12. PREPARE REPLACEMENT INFORMATION
+# ============================================================
+
+replacement_info = df_replacement_unique[
+    [
+        'ESN',
+        'Breather/EGB Replacement Date 1'
+    ]
+].copy()
+
+replacement_info = replacement_info.rename(
+    columns={
+        'Breather/EGB Replacement Date 1':
+        'REPLACEMENT_DATE'
+    }
+)
+
+
+# ============================================================
+# 13. MERGE REPLACEMENT DATE WITH TAKEOFF DATA
+# ============================================================
+
+df_merged = df.merge(
+    replacement_info,
+    on='ESN',
+    how='inner'
+)
+
+
+# ============================================================
+# 14. NORMALIZE DATES
+# ============================================================
+
+df_merged['DATE_ONLY'] = (
+    df_merged['DATETIME'].dt.normalize()
+)
+
+df_merged['REPLACEMENT_DATE_ONLY'] = (
+    pd.to_datetime(
+        df_merged['REPLACEMENT_DATE']
+    ).dt.normalize()
+)
+
+
+# ============================================================
+# 15. KEEP ONLY DATA BEFORE REPLACEMENT
+# ============================================================
+#
+# IMPORTANT:
+#
+# We do NOT use any post-replacement data for
+# Mahalanobis calculation.
+#
+# Strictly BEFORE replacement is used.
+# ============================================================
+
+before_replacement = df_merged[
+    df_merged['DATE_ONLY']
+    <
+    df_merged['REPLACEMENT_DATE_ONLY']
+].copy()
+
+
+print("\n" + "=" * 70)
+print("STEP 3 - BEFORE REPLACEMENT")
+print("=" * 70)
+
+print(
+    "ESNs with pre-replacement data:",
+    before_replacement['ESN'].nunique()
+)
+
+print(
+    "Pre-replacement rows:",
+    len(before_replacement)
+)
+
+
+# ============================================================
+# 16. SORT DATA
+# ============================================================
+
+before_replacement = (
+    before_replacement
+    .sort_values(
+        ['ESN', 'DATETIME']
+    )
+    .reset_index(drop=True)
+)
+
+
+# ============================================================
+# 17. CREATE CYCLE NUMBER
+# ============================================================
+#
+# There is NO cycle-count column in the dataset.
+#
+# Therefore every takeoff observation is treated
+# as one sequential cycle.
+#
+# Example:
+#
+# ESN 123
+#
+# first row  -> 0
+# second row -> 1
+# third row  -> 2
+# ...
+# last row   -> N
+#
+# This is based on takeoff observations, NOT dates.
+# ============================================================
+
+before_replacement['CYCLE_NUMBER'] = (
+    before_replacement
+    .groupby('ESN')
+    .cumcount()
+)
+
+
+# ============================================================
+# 18. FIND LAST CYCLE FOR EACH ESN
+# ============================================================
+
+last_cycle = (
+    before_replacement
+    .groupby('ESN')['CYCLE_NUMBER']
+    .max()
+    .rename('LAST_CYCLE')
+)
+
+
+before_replacement = before_replacement.merge(
+    last_cycle,
+    on='ESN',
+    how='left'
+)
+
+
+# ============================================================
+# 19. CALCULATE LIFE PERCENT
+# ============================================================
+#
+# Life is calculated ONLY from cycle number.
+#
+# First cycle:
+#     0%
+#
+# Final cycle:
+#     100%
+#
+# Calendar time is completely ignored.
+# ============================================================
+
+before_replacement['LIFE_PERCENT'] = np.where(
+    before_replacement['LAST_CYCLE'] > 0,
+
+    (
+        before_replacement['CYCLE_NUMBER']
+        /
+        before_replacement['LAST_CYCLE']
+    ) * 100,
+
+    0
+)
+
+
+# ============================================================
+# 20. REMOVE ESNs WITH TOO FEW OBSERVATIONS
+# ============================================================
+
+observation_counts = (
+    before_replacement
+    .groupby('ESN')
+    .size()
+)
+
+valid_observation_esns = observation_counts[
+    observation_counts >= MIN_TOTAL_OBSERVATIONS
+].index
+
+
+before_replacement = before_replacement[
+    before_replacement['ESN'].isin(
+        valid_observation_esns
+    )
+].copy()
+
+
+print("\n" + "=" * 70)
+print("STEP 4 - OBSERVATION FILTER")
+print("=" * 70)
+
+print(
+    "ESNs with >= "
+    f"{MIN_TOTAL_OBSERVATIONS}"
+    " pre-replacement observations:",
+    before_replacement['ESN'].nunique()
+)
+
+
+# ============================================================
+# 21. APPLY EMA TO SENSOR DATA
+# ============================================================
+
+ema_columns = []
+
+for sensor in sensor_columns:
+
+    ema_name = f'{sensor}_EMA'
+
+    before_replacement[ema_name] = (
+        before_replacement
+        .groupby('ESN')[sensor]
+        .transform(
+            lambda x:
+            x.ewm(
+                span=EMA_SPAN,
+                adjust=False
+            ).mean()
+        )
+    )
+
+    ema_columns.append(ema_name)
+
+
+# ============================================================
+# 22. REMOVE ROWS WITH MISSING SENSOR VALUES
+# ============================================================
+
+before_replacement = before_replacement.dropna(
+    subset=ema_columns
+).copy()
+
+
+# ============================================================
+# 23. ROBUST MAHALANOBIS FUNCTION
+# ============================================================
+
+def calculate_robust_mahalanobis(
+    data,
+    feature_columns,
+    baseline_mask
+):
+    """
+    Calculate robust Mahalanobis distance.
+
+    The baseline is used to estimate a robust
+    centre and covariance matrix.
+
+    Mahalanobis distance is then calculated
+    for EVERY observation of that ESN.
+    """
+
+    X = data[feature_columns].values
+
+    baseline_X = X[baseline_mask]
+
+    # --------------------------------------------------------
+    # Check baseline size
+    # --------------------------------------------------------
+
+    if len(baseline_X) < MIN_BASELINE_OBSERVATIONS:
+        return None
+
+    # Need more observations than dimensions
+    if len(baseline_X) <= len(feature_columns):
+        return None
+
+    try:
+
+        # ----------------------------------------------------
+        # Robust covariance estimator
+        # ----------------------------------------------------
+
+        robust_cov = MinCovDet(
+            random_state=42,
+            support_fraction=None
+        )
+
+        robust_cov.fit(baseline_X)
+
+        center = robust_cov.location_
+        covariance = robust_cov.covariance_
+
+        # ----------------------------------------------------
+        # Numerical stabilization
+        # ----------------------------------------------------
+
+        covariance = (
+            covariance
+            +
+            np.eye(
+                covariance.shape[0]
+            ) * 1e-8
+        )
+
+        covariance_inv = np.linalg.pinv(
+            covariance
+        )
+
+        # ----------------------------------------------------
+        # Mahalanobis distance
+        # ----------------------------------------------------
+
+        differences = X - center
+
+        mahalanobis_squared = np.einsum(
+            'ij,jk,ik->i',
+            differences,
+            covariance_inv,
+            differences
+        )
+
+        mahalanobis_squared = np.maximum(
+            mahalanobis_squared,
+            0
+        )
+
+        mahalanobis = np.sqrt(
+            mahalanobis_squared
+        )
+
+        return mahalanobis
+
+    except Exception as e:
+
+        print(
+            "Mahalanobis calculation failed:",
+            e
+        )
+
+        return None
+
+
+# ============================================================
+# 24. CALCULATE MAHALANOBIS FOR EACH ESN
+# ============================================================
+#
+# IMPORTANT:
+#
+# Each ESN gets its OWN healthy baseline.
+#
+# Healthy baseline:
+#     20% - 60% life
+#
+# Mahalanobis parameters are therefore
+# ESN-specific.
+# ============================================================
+
+before_replacement[
+    'MAHALANOBIS_SCORE'
+] = np.nan
+
+
+processed_esns = []
+
+failed_esns = []
+
+
+for esn, group in before_replacement.groupby('ESN'):
+
+    group = group.copy()
+
+    # --------------------------------------------------------
+    # Healthy baseline
+    # --------------------------------------------------------
+
+    baseline_mask = (
+        (group['LIFE_PERCENT'] >= BASELINE_START)
+        &
+        (group['LIFE_PERCENT'] <= BASELINE_END)
+    )
+
+    baseline_count = baseline_mask.sum()
+
+    if baseline_count < MIN_BASELINE_OBSERVATIONS:
+
+        failed_esns.append(
+            (
+                esn,
+                'Not enough baseline observations'
+            )
+        )
+
+        continue
+
+    # --------------------------------------------------------
+    # Calculate robust Mahalanobis
+    # --------------------------------------------------------
+
+    scores = calculate_robust_mahalanobis(
+        group,
+        ema_columns,
+        baseline_mask.values
+    )
+
+    if scores is None:
+
+        failed_esns.append(
+            (
+                esn,
+                'Mahalanobis calculation failed'
+            )
+        )
+
+        continue
+
+    # --------------------------------------------------------
+    # Put scores back
+    # --------------------------------------------------------
+
+    before_replacement.loc[
+        group.index,
+        'MAHALANOBIS_SCORE'
+    ] = scores
+
+    processed_esns.append(esn)
+
+
+print("\n" + "=" * 70)
+print("STEP 5 - MAHALANOBIS")
+print("=" * 70)
+
+print(
+    "Successfully processed ESNs:",
+    len(processed_esns)
+)
+
+print(
+    "Failed / insufficient ESNs:",
+    len(failed_esns)
+)
+
+
+# ============================================================
+# 25. KEEP ONLY SUCCESSFULLY PROCESSED ESNs
+# ============================================================
+
+before_replacement = before_replacement[
+    before_replacement['ESN'].isin(
+        processed_esns
+    )
+].copy()
+
+
+# ============================================================
+# 26. CALCULATE ROLLING MAHALANOBIS
+# ============================================================
+
+before_replacement[
+    'ROLLING_MAHALANOBIS'
+] = (
+    before_replacement
+    .groupby('ESN')['MAHALANOBIS_SCORE']
+    .transform(
+        lambda x:
+        x.rolling(
+            window=ROLLING_WINDOW,
+            min_periods=1
+        ).mean()
+    )
+)
+
+
+# ============================================================
+# 27. CALCULATE HEALTHY P95 FOR EACH ESN
+# ============================================================
+#
+# This is important:
+#
+# We DO NOT use one threshold for every engine.
+#
+# Each ESN gets its own healthy P95.
+# ============================================================
+
+healthy_thresholds = []
+
+
+for esn, group in before_replacement.groupby('ESN'):
+
+    healthy_mask = (
+        (group['LIFE_PERCENT'] >= BASELINE_START)
+        &
+        (group['LIFE_PERCENT'] <= BASELINE_END)
+    )
+
+    healthy_scores = group.loc[
+        healthy_mask,
+        'ROLLING_MAHALANOBIS'
+    ].dropna()
+
+    if len(healthy_scores) == 0:
+        continue
+
+    threshold = np.percentile(
+        healthy_scores,
+        PERCENTILE
+    )
+
+    healthy_thresholds.append(
+        {
+            'ESN': esn,
+            'HEALTHY_P95': threshold,
+            'HEALTHY_COUNT': len(
+                healthy_scores
+            )
+        }
+    )
+
+
+healthy_thresholds_df = pd.DataFrame(
+    healthy_thresholds
+)
+
+
+# ============================================================
+# 28. MERGE ESN-SPECIFIC THRESHOLDS
+# ============================================================
+
+before_replacement = before_replacement.merge(
+    healthy_thresholds_df[
+        ['ESN', 'HEALTHY_P95']
+    ],
+    on='ESN',
+    how='left'
+)
+
+
+# ============================================================
+# 29. CHECK IF MAHALANOBIS IS ABOVE HEALTHY THRESHOLD
+# ============================================================
+
+before_replacement[
+    'ABOVE_THRESHOLD'
+] = (
+    before_replacement[
+        'ROLLING_MAHALANOBIS'
+    ]
+    >
+    before_replacement[
+        'HEALTHY_P95'
+    ]
+)
+
+
+# ============================================================
+# 30. SUSTAINED DEGRADATION
+# ============================================================
+#
+# We don't want one isolated spike.
+#
+# Require at least 5 consecutive observations
+# above the ESN's healthy threshold.
+# ============================================================
+
+before_replacement[
+    'ABOVE_THRESHOLD_COUNT'
+] = (
+    before_replacement
+    .groupby('ESN')['ABOVE_THRESHOLD']
+    .transform(
+        lambda x:
+        x.astype(int)
+         .rolling(
+             window=SUSTAINED_POINTS,
+             min_periods=SUSTAINED_POINTS
+         )
+         .sum()
+    )
+)
+
+
+before_replacement[
+    'SUSTAINED_DEGRADATION'
+] = (
+    before_replacement[
+        'ABOVE_THRESHOLD_COUNT'
+    ]
+    >=
+    SUSTAINED_POINTS
+)
+
+
+# ============================================================
+# 31. FIND FIRST DETECTION POINT
+# ============================================================
+
+detection_results = []
+
+
+for esn, group in before_replacement.groupby('ESN'):
+
+    sustained = group[
+        group['SUSTAINED_DEGRADATION']
+    ]
+
+    if len(sustained) == 0:
+
+        detection_results.append(
+            {
+                'ESN': esn,
+                'DETECTED': False,
+                'DETECTION_CYCLE': np.nan,
+                'DETECTION_LIFE_PERCENT': np.nan,
+                'HEALTHY_P95':
+                    group['HEALTHY_P95'].iloc[0]
+            }
+        )
+
+    else:
+
+        first_detection = sustained.iloc[0]
+
+        detection_results.append(
+            {
+                'ESN': esn,
+                'DETECTED': True,
+                'DETECTION_CYCLE':
+                    first_detection[
+                        'CYCLE_NUMBER'
+                    ],
+                'DETECTION_LIFE_PERCENT':
+                    first_detection[
+                        'LIFE_PERCENT'
+                    ],
+                'HEALTHY_P95':
+                    group['HEALTHY_P95'].iloc[0]
+            }
+        )
+
+
+detection_results_df = pd.DataFrame(
+    detection_results
+)
+
+
+# ============================================================
+# 32. FINAL RESULTS
+# ============================================================
+
+print("\n" + "=" * 70)
+print("FINAL RESULTS")
+print("=" * 70)
+
+print(
+    "Total processed ESNs:",
+    len(detection_results_df)
+)
+
+print(
+    "Detected ESNs:",
+    detection_results_df[
+        'DETECTED'
+    ].sum()
+)
+
+print(
+    "Not detected ESNs:",
+    (
+        ~detection_results_df[
+            'DETECTED'
+        ]
+    ).sum()
+)
+
+
+# ============================================================
+# 33. DETECTION SUMMARY
+# ============================================================
+
+display(
+    detection_results_df
+    .sort_values(
+        'DETECTION_LIFE_PERCENT'
+    )
+    .head(30)
+)
+
+
+# ============================================================
+# 34. LIFE / CYCLE VALIDATION
+# ============================================================
+
+cycle_validation = (
+    before_replacement
+    .groupby('ESN')
+    .agg(
+        FIRST_CYCLE=(
+            'CYCLE_NUMBER',
+            'min'
+        ),
+
+        LAST_CYCLE=(
+            'CYCLE_NUMBER',
+            'max'
+        ),
+
+        TOTAL_ROWS=(
+            'CYCLE_NUMBER',
+            'count'
+        ),
+
+        FIRST_LIFE=(
+            'LIFE_PERCENT',
+            'min'
+        ),
+
+        LAST_LIFE=(
+            'LIFE_PERCENT',
+            'max'
+        ),
+
+        REPLACEMENT_DATE=(
+            'REPLACEMENT_DATE',
+            'first'
+        )
+    )
+    .reset_index()
+)
+
+
+print("\n" + "=" * 70)
+print("CYCLE VALIDATION")
+print("=" * 70)
+
+display(
+    cycle_validation.head(20)
+)
+
+
+# ============================================================
+# 35. PLOT MAHALANOBIS FOR INDIVIDUAL ESNs
+# ============================================================
+
+def plot_esn(esn):
+
+    group = before_replacement[
+        before_replacement['ESN'] == esn
+    ].copy()
+
+    if len(group) == 0:
+
+        print(
+            f"No data available for ESN {esn}"
+        )
+
+        return
+
+    threshold = group[
+        'HEALTHY_P95'
+    ].iloc[0]
+
+    plt.figure(
+        figsize=(12, 6)
+    )
+
+    plt.plot(
+        group['LIFE_PERCENT'],
+        group['MAHALANOBIS_SCORE'],
+        label='Mahalanobis',
+        alpha=0.4
+    )
+
+    plt.plot(
+        group['LIFE_PERCENT'],
+        group['ROLLING_MAHALANOBIS'],
+        label='Rolling Mahalanobis',
+        linewidth=2
+    )
+
+    plt.axhline(
+        threshold,
+        linestyle='--',
+        label='Healthy P95'
+    )
+
+    # --------------------------------------------------------
+    # Detection point
+    # --------------------------------------------------------
+
+    detection = group[
+        group['SUSTAINED_DEGRADATION']
+    ]
+
+    if len(detection) > 0:
+
+        detection_point = detection.iloc[0]
+
+        plt.axvline(
+            detection_point[
+                'LIFE_PERCENT'
+            ],
+            linestyle=':',
+            linewidth=2,
+            label='Detection'
+        )
+
+    plt.axvspan(
+        BASELINE_START,
+        BASELINE_END,
+        alpha=0.15,
+        label='Healthy baseline'
+    )
+
+    plt.xlabel(
+        'Life Percent (%)'
+    )
+
+    plt.ylabel(
+        'Mahalanobis Distance'
+    )
+
+    plt.title(
+        f'Breather Degradation - ESN {esn}'
+    )
+
+    plt.legend()
+
+    plt.grid(
+        alpha=0.3
+    )
+
+    plt.tight_layout()
+
+    plt.show()
+
+
+# ============================================================
+# 36. EXAMPLE:
+#     PLOT FIRST PROCESSED ESN
+# ============================================================
+
+if len(processed_esns) > 0:
+
+    example_esn = processed_esns[0]
+
+    plot_esn(example_esn)
