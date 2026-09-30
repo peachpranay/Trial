@@ -1,4 +1,6 @@
 import pytest
+from unittest.mock import MagicMock, patch
+
 import rraid
 
 
@@ -19,7 +21,16 @@ import rraid
     ],
 )
 def test_lazy_exports(name):
-    assert getattr(rraid, name) is not None
+    mock_module = MagicMock()
+
+    # Whatever attribute __getattr__ asks for should exist
+    mock_module.__getattr__ = lambda attr: MagicMock()
+
+    with patch("importlib.import_module", return_value=mock_module) as mock_import:
+        result = getattr(rraid, name)
+
+        assert result is not None
+        mock_import.assert_called_once()
 
 
 def test_unknown_attribute():
