@@ -1,0 +1,27 @@
+import pytest
+import rraid
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "RRAidTarget",
+        "build_converter_configs",
+        "build_scorer",
+        "run_scan",
+        "calculate_cost",
+        "estimate_all_strategies",
+        "print_cost_comparison",
+        "build_llm_configs",
+        "profile_token_usage",
+        "load_model_pricing",
+        "LLMPricingConfig",
+    ],
+)
+def test_lazy_exports(name):
+    assert getattr(rraid, name) is not None
+
+
+def test_unknown_attribute():
+    with pytest.raises(AttributeError):
+        getattr(rraid, "does_not_exist")
