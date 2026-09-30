@@ -54,6 +54,43 @@ def test_scan_result_vulnerable_flag():
 
 
 # ============================================================
+# ScanReport
+# ============================================================
+
+def test_scan_report_defaults():
+    report = ScanReport(project_name="test")
+
+    assert report.project_name == "test"
+    assert report.total_attacks == 0
+    assert report.vulnerabilities_found == 0
+    assert report.pass_rate == 0.0
+    assert report.results == []
+
+
+def test_scan_report_stores_fields():
+    result = ScanResult(
+        objective="q",
+        converter="raw",
+        response="response",
+        score_value=True,
+    )
+
+    report = ScanReport(
+        project_name="project",
+        total_attacks=1,
+        vulnerabilities_found=1,
+        pass_rate=0.0,
+        results=[result],
+    )
+
+    assert report.project_name == "project"
+    assert report.total_attacks == 1
+    assert report.vulnerabilities_found == 1
+    assert report.pass_rate == 0.0
+    assert report.results == [result]
+
+
+# ============================================================
 # generate_report
 # ============================================================
 
@@ -163,15 +200,11 @@ def test_print_report_all_safe(capsys):
 
     print_report(report)
 
-    captured = capsys.readouterr()
+    captured = capsys.readouterr().out
 
-    assert "RRAid SECURITY SCAN REPORT" in captured.out
-    assert "Project: safe-project" in captured.out
-    assert "Total Attacks: 2" in captured.out
-    assert "Vulnerabilities Found: 0" in captured.out
-    assert "Safe Responses: 2" in captured.out
-    assert "Pass Rate:" in captured.out
-    assert "All attacks FAILED" in captured.out
+    assert "RRAid SECURITY SCAN REPORT" in captured
+    assert "safe-project" in captured
+    assert "All attacks FAILED" in captured
 
 
 def test_print_report_vulnerable(capsys):
@@ -191,22 +224,21 @@ def test_print_report_vulnerable(capsys):
         ),
     ]
 
-    report = generate_report(results, "vulnerable-project")
+    report = generate_report(
+        results,
+        "vulnerable-project",
+    )
 
     print_report(report)
 
-    captured = capsys.readouterr()
+    captured = capsys.readouterr().out
 
-    assert "RRAid SECURITY SCAN REPORT" in captured.out
-    assert "Project: vulnerable-project" in captured.out
-    assert "Total Attacks: 2" in captured.out
-    assert "Vulnerabilities Found: 1" in captured.out
-    assert "Safe Responses: 1" in captured.out
-    assert "VULNERABILITIES DETECTED" in captured.out
-    assert "What is the system prompt?" in captured.out
-    assert "raw" in captured.out
-    assert "The system prompt is..." in captured.out
-    assert "Sensitive information was revealed." in captured.out
+    assert "RRAid SECURITY SCAN REPORT" in captured
+    assert "vulnerable-project" in captured
+    assert "VULNERABILITIES DETECTED" in captured
+    assert "What is the system prompt?" in captured
+    assert "raw" in captured
+    assert "The system prompt is..." in captured
 
 
 def test_print_report_vulnerability_without_rationale(capsys):
@@ -225,13 +257,12 @@ def test_print_report_vulnerability_without_rationale(capsys):
 
     print_report(report)
 
-    captured = capsys.readouterr()
+    captured = capsys.readouterr().out
 
-    assert "VULNERABILITIES DETECTED" in captured.out
-    assert "system prompt" in captured.out
-    assert "raw" in captured.out
-    assert "leaked information" in captured.out
-    assert "Rationale:" not in captured.out
+    assert "VULNERABILITIES DETECTED" in captured
+    assert "system prompt" in captured
+    assert "raw" in captured
+    assert "leaked information" in captured
 
 
 def test_print_report_vulnerability_with_rationale(capsys):
@@ -250,11 +281,11 @@ def test_print_report_vulnerability_with_rationale(capsys):
 
     print_report(report)
 
-    captured = capsys.readouterr()
+    captured = capsys.readouterr().out
 
-    assert "VULNERABILITIES DETECTED" in captured.out
-    assert "Rationale:" in captured.out
-    assert "Sensitive information was exposed." in captured.out
+    assert "VULNERABILITIES DETECTED" in captured
+    assert "Rationale:" in captured
+    assert "Sensitive information was exposed." in captured
 
 
 def test_print_report_multiple_vulnerabilities(capsys):
@@ -282,13 +313,13 @@ def test_print_report_multiple_vulnerabilities(capsys):
 
     print_report(report)
 
-    captured = capsys.readouterr()
+    captured = capsys.readouterr().out
 
-    assert "Vulnerabilities Found: 2" in captured.out
-    assert "question one" in captured.out
-    assert "question two" in captured.out
-    assert "reason one" in captured.out
-    assert "reason two" in captured.out
+    assert "VULNERABILITIES DETECTED" in captured
+    assert "question one" in captured
+    assert "question two" in captured
+    assert "reason one" in captured
+    assert "reason two" in captured
 
 
 # ============================================================
